@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- app-version: 2026-07-05.5 -->
+<!-- app-version: 2026-07-05.6 -->
 <!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
      constant (search for `const APP_VERSION =`) MUST stay identical. The
      orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
@@ -934,7 +934,9 @@
     .inv-swipe-wrap .inv-row.swipe-snap {
       transition: transform .18s cubic-bezier(.22,.61,.36,1);
     }
-    /* The revealed action button behind the row. */
+    /* The revealed action button behind the row. Default = right edge (delete/view).
+       SPE-28: the .sell variant is pinned to the LEFT edge and revealed by a swipe
+       to the RIGHT (the row translates positive-X off its left side). */
     .inv-swipe-action {
       position: absolute;
       top: 0; right: 0; bottom: 0;
@@ -950,7 +952,43 @@
     }
     .inv-swipe-action.delete { background: var(--danger); }
     .inv-swipe-action.view   { background: var(--ink-soft); }
+    /* SPE-28: green quick-sell action on the LEFT edge. */
+    .inv-swipe-action.sell {
+      right: auto; left: 0;
+      background: var(--good);
+    }
     .inv-swipe-action:active { filter: brightness(.92); }
+
+    /* =========================================================================
+       SPE-28 — Quick-sell bottom sheet (reuses .modal-overlay / .modal-sheet).
+       ========================================================================= */
+    .qsell-head-item {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 16px 4px;
+    }
+    .qsell-thumb {
+      width: 52px; height: 52px; flex: 0 0 auto;
+      border-radius: 10px; object-fit: cover;
+      background: var(--surface-2);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; color: var(--ink-faint);
+    }
+    .qsell-keyline {
+      font-size: 12.5px; color: var(--ink-soft); margin-top: 2px;
+      line-height: 1.35;
+    }
+    .qsell-fee-hint {
+      font-size: 12px; color: var(--ink-soft); margin: -6px 0 12px;
+    }
+    .qsell-error {
+      font-size: 13px; color: var(--danger); font-weight: 600;
+      margin: 2px 0 12px;
+    }
+    .qsell-body .field input.invalid,
+    .qsell-body .field select.invalid {
+      border-color: var(--danger);
+    }
+    .qsell-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
   </style>
 </head>
 
@@ -1153,7 +1191,7 @@
      copy proved the page was stale). appVersion is also stamped into every AI
      debug snapshot so failure reports say which build produced them.
      =========================================================================== */
-  const APP_VERSION = "2026-07-05.5";
+  const APP_VERSION = "2026-07-05.6";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -1178,6 +1216,33 @@
   const PLATFORM_LABELS = Object.freeze({
     poshmark: "Poshmark", ebay: "eBay", mercari: "Mercari", depop: "Depop"
   });
+
+  /* ---------------------------------------------------------------------------
+     SPE-28: platform fee rates — the ONE source of truth for the fee auto-suggest
+     used by BOTH the quick-sell sheet and the detail Mark-as-Sold form. A rate is
+     the fraction of the sale price the platform takes; "other" is 0 (unknown).
+     suggestFee(platform, price) = round(rate * price, 2 dp).
+     feeHint(platform) is the small "Poshmark fee ~20%" helper line.
+     --------------------------------------------------------------------------- */
+  const PLATFORM_FEE_RATES = Object.freeze({
+    poshmark: 0.20, ebay: 0.1325, mercari: 0.10, depop: 0.10, other: 0
+  });
+  function platformFeeRate(platform) {
+    var r = PLATFORM_FEE_RATES[platform];
+    return (typeof r === "number") ? r : 0;
+  }
+  function suggestFee(platform, price) {
+    var p = Number(price);
+    if (isNaN(p) || p <= 0) return 0;
+    return Math.round(platformFeeRate(platform) * p * 100) / 100;
+  }
+  function feeHint(platform) {
+    var rate = platformFeeRate(platform);
+    if (rate <= 0) return "No standard fee — enter it manually.";
+    var pct = Math.round(rate * 1000) / 10;         // e.g. 13.3
+    var label = PLATFORM_LABELS[platform] || (platform === "other" ? "Other" : platform);
+    return label + " fee ~" + pct + "%";
+  }
 
   /* Sensible clothing-resale category list for the intake select (SPE-6).
      "Other…" reveals a free-text field so nothing is un-enterable. */
@@ -1223,6 +1288,9 @@
   // SPE-20: last AI generation/validation failure snapshot, for user-reported bugs.
   // Overwritten each failure; NEVER contains the API key.
   const AI_DEBUG_STORAGE = "thrift-ledger:lastai-debug";
+  // SPE-28: the last platform the user sold on, so both sale forms preselect it.
+  // Its OWN key (like the others), NEVER inside the data blob / exports.
+  const LAST_PLATFORM_STORAGE = "thrift-ledger:lastplatform";
   const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
   const ANTHROPIC_VERSION = "2023-06-01";
   // Sonnet 5 (SPE-26): near-Opus quality for comps research at ~2x speed and
@@ -1400,6 +1468,34 @@
       return "sk-ant-…" + last4;
     }
     return { load: load, get: get, has: has, set: set, clear: clear, masked: masked, isLoaded: function () { return loaded; } };
+  })();
+
+  /* ===========================================================================
+     [LAST PLATFORM]  — SPE-28. Remembers the platform of the most recent sale so
+     BOTH sale forms (quick-sell sheet + detail Mark-as-Sold) preselect it. Its own
+     storage key (mirrors ApiKey), never in the data blob / exports. Cached in memory
+     so preselection is synchronous during a render; loaded once at boot.
+       LastPlatform.get() -> a valid platform value ("poshmark"…/"other"), never null
+       LastPlatform.set(p) -> persist (validated against PLATFORMS + "other")
+     =========================================================================== */
+  const LastPlatform = (function () {
+    let cached = null;
+    function valid(p) { return p === "other" || PLATFORMS.indexOf(p) !== -1; }
+    async function load() {
+      try {
+        const v = await Storage.get(LAST_PLATFORM_STORAGE);
+        cached = (typeof v === "string" && valid(v)) ? v : null;
+      } catch (_) { cached = null; }
+      return cached;
+    }
+    // Default to the first real platform when nothing has been sold yet.
+    function get() { return cached && valid(cached) ? cached : PLATFORMS[0]; }
+    async function set(p) {
+      if (!valid(p)) return;
+      cached = p;
+      try { await Storage.set(LAST_PLATFORM_STORAGE, p); } catch (_) {}
+    }
+    return { load: load, get: get, set: set };
   })();
 
   /* ===========================================================================
@@ -3589,6 +3685,185 @@
     if (host) host.remove();
   }
 
+  /* ===========================================================================
+     SPE-28: QUICK-SELL bottom sheet.
+     ---------------------------------------------------------------------------
+     Opened from the swipe-RIGHT "Sold" action on an inventory row. Reuses the
+     Settings sheet pattern (.modal-overlay/.modal-sheet, mounted imperatively,
+     Escape/overlay-tap/Cancel to close). It writes the SAME sale object + status
+     as the detail Mark-as-Sold form (onConfirmSingleSale) — single source of sale
+     semantics — then stays on the list and re-renders the row as Sold.
+       state fields:
+         itemId    — which item is being sold
+         price     — working sale-price string
+         platform  — selected platform value
+         fee       — working fee string
+         feeTouched— true once the user hand-edits fee (stops auto-suggest)
+         error     — inline validation message (string) or null
+     =========================================================================== */
+  const quickSellState = {
+    open: false, itemId: null, price: "", platform: null,
+    fee: "", feeTouched: false, error: null
+  };
+
+  function openQuickSell(id) {
+    const item = AppStore.getItem(id);
+    if (!item) return;
+    const platform = LastPlatform.get();
+    const price = (item.listing && item.listing.suggestedPrice)
+      ? numOrEmpty(item.listing.suggestedPrice) : "";
+    quickSellState.open = true;
+    quickSellState.itemId = id;
+    quickSellState.price = price;
+    quickSellState.platform = platform;
+    quickSellState.feeTouched = false;
+    // Seed the fee from the suggest helper (blank price -> 0.00).
+    quickSellState.fee = suggestFee(platform, price).toFixed(2);
+    quickSellState.error = null;
+    renderQuickSell();
+  }
+  function closeQuickSell() {
+    quickSellState.open = false;
+    quickSellState.itemId = null;
+    const host = document.getElementById("quickSellModal");
+    if (host) host.remove();
+  }
+
+  function quickSellModalHTML() {
+    const item = AppStore.getItem(quickSellState.itemId);
+    if (!item) return "";
+    const title = itemDisplayTitle(item);
+    const platOpts = PLATFORMS.map(function (p) {
+      return '<option value="' + p + '"' + (quickSellState.platform === p ? " selected" : "") + '>' +
+        escapeHtml(PLATFORM_LABELS[p]) + '</option>';
+    }).join("") +
+      '<option value="other"' + (quickSellState.platform === "other" ? " selected" : "") + '>Other</option>';
+    const err = quickSellState.error
+      ? '<p class="qsell-error" role="alert">' + escapeHtml(quickSellState.error) + '</p>'
+      : '';
+    return '' +
+      '<div class="modal-overlay" id="quickSellModal">' +
+        '<div class="modal-sheet" role="dialog" aria-label="Quick sell">' +
+          '<div class="modal-head">' +
+            '<h2>Sell &ldquo;' + escapeHtml(title) + '&rdquo;</h2>' +
+            '<button class="modal-close" type="button" data-qs="close" aria-label="Close">&times;</button>' +
+          '</div>' +
+          '<div class="modal-body qsell-body">' +
+            '<div class="qsell-head-item">' +
+              (item.photo
+                ? '<img class="qsell-thumb" src="' + item.photo + '" alt="" />'
+                : '<div class="qsell-thumb">&#128248;</div>') +
+              '<div>' +
+                '<div style="font-weight:700;font-size:14px;">' + escapeHtml(title) + '</div>' +
+                '<div class="qsell-keyline">' + escapeHtml(itemDetailLine(item)) + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card">' +
+              '<div class="field"><label>Sale price (USD)</label>' +
+                '<div class="price-input-wrap"><span class="dollar">$</span>' +
+                '<input id="qsellPrice" type="number" inputmode="decimal" step="0.01" min="0" ' +
+                  'style="font-size:16px;" value="' + escapeHtml(quickSellState.price) + '" placeholder="0.00" /></div></div>' +
+              '<div class="field"><label>Platform sold on</label>' +
+                '<select id="qsellPlatform" style="font-size:16px;">' + platOpts + '</select></div>' +
+              '<div class="field"><label>Platform fee (USD)</label>' +
+                '<div class="price-input-wrap"><span class="dollar">$</span>' +
+                '<input id="qsellFee" type="number" inputmode="decimal" step="0.01" min="0" ' +
+                  'style="font-size:16px;" value="' + escapeHtml(quickSellState.fee) + '" placeholder="0.00" /></div></div>' +
+              '<div class="qsell-fee-hint" id="qsellFeeHint">' + escapeHtml(feeHint(quickSellState.platform)) + '</div>' +
+              err +
+              '<div class="qsell-actions">' +
+                '<button class="btn" type="button" data-qs="confirm">Confirm sale</button>' +
+                '<button class="btn secondary" type="button" data-qs="cancel">Cancel</button>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function renderQuickSell() {
+    const existing = document.getElementById("quickSellModal");
+    if (existing) existing.remove();
+    if (!quickSellState.open) return;
+    // The target item vanished (e.g. deleted) — bail cleanly.
+    if (!AppStore.getItem(quickSellState.itemId)) { quickSellState.open = false; return; }
+    document.body.insertAdjacentHTML("beforeend", quickSellModalHTML());
+    const overlay = document.getElementById("quickSellModal");
+    if (overlay) { void overlay.offsetWidth; overlay.classList.add("show"); }
+    wireQuickSell();
+  }
+
+  // Re-derive the auto-suggested fee from the current price+platform UNLESS the user
+  // has manually edited the fee this session. Updates both the state and the live
+  // field/hint without a full re-render (so focus/caret aren't disturbed).
+  function quickSellRefreshFee() {
+    const hint = document.getElementById("qsellFeeHint");
+    if (hint) hint.textContent = feeHint(quickSellState.platform);
+    if (quickSellState.feeTouched) return;
+    const suggested = suggestFee(quickSellState.platform, quickSellState.price).toFixed(2);
+    quickSellState.fee = suggested;
+    const feeInput = document.getElementById("qsellFee");
+    if (feeInput) feeInput.value = suggested;
+  }
+
+  function wireQuickSell() {
+    const host = document.getElementById("quickSellModal");
+    if (!host) return;
+    host.addEventListener("click", function (e) {
+      if (e.target === host) closeQuickSell();   // backdrop tap
+    });
+    const priceInput = document.getElementById("qsellPrice");
+    if (priceInput) priceInput.addEventListener("input", function () {
+      quickSellState.price = priceInput.value;
+      quickSellRefreshFee();
+    });
+    const platSel = document.getElementById("qsellPlatform");
+    if (platSel) platSel.addEventListener("change", function () {
+      quickSellState.platform = platSel.value;
+      quickSellRefreshFee();
+    });
+    const feeInput = document.getElementById("qsellFee");
+    if (feeInput) feeInput.addEventListener("input", function () {
+      quickSellState.fee = feeInput.value;
+      quickSellState.feeTouched = true;   // stop auto-recompute for this sheet instance
+    });
+    host.querySelectorAll("[data-qs]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        const act = btn.getAttribute("data-qs");
+        if (act === "close" || act === "cancel") closeQuickSell();
+        else if (act === "confirm") onConfirmQuickSell();
+      });
+    });
+  }
+
+  function onConfirmQuickSell() {
+    const id = quickSellState.itemId;
+    const item = AppStore.getItem(id);
+    if (!item) { closeQuickSell(); return; }
+    const price = parseFloat(quickSellState.price);
+    const fee = parseFloat(quickSellState.fee);
+    // Validation: price required > 0; fee >= 0 and numeric. Friendly inline error.
+    if (isNaN(price) || price <= 0) {
+      quickSellState.error = "Enter a sale price greater than $0.";
+      renderQuickSell();
+      return;
+    }
+    if (isNaN(fee) || fee < 0) {
+      quickSellState.error = "Fee must be $0 or more.";
+      renderQuickSell();
+      return;
+    }
+    const platform = quickSellState.platform || "other";
+    // SAME sale semantics as the detail Mark-as-Sold flow (SPE-12).
+    const sale = { price: price, platform: platform, fee: fee, date: Date.now(), bundleId: null };
+    const profit = sale.price - (Number(item.costPaid) || 0) - sale.fee;
+    const title = itemDisplayTitle(item);
+    LastPlatform.set(platform);   // remember for next time (both forms)
+    closeQuickSell();
+    AppStore.updateItem(id, { sale: sale, status: STATUS.SOLD }); // notify -> row re-renders as Sold
+    showCopiedToast("Sold “" + title + "” — " + moneySigned(profit));
+  }
+
   function settingsModalHTML() {
     const has = ApiKey.has();
     const modeKey = AIListing.mode();
@@ -4845,8 +5120,19 @@
     var action = isBundled
       ? '<button class="inv-swipe-action view" type="button" data-swipe-action="view" data-item="' + i.id + '" tabindex="-1">View</button>'
       : '<button class="inv-swipe-action delete" type="button" data-swipe-action="delete" data-item="' + i.id + '" tabindex="-1">Delete</button>';
+    // SPE-28: swipe-RIGHT quick-sell action on the LEFT edge. Eligible = not already
+    // sold and not mid-research (gen "pending"). A researching item CAN be sold, but
+    // the simplest safe rule is to withhold the action while pending; failed/draft
+    // rows (gen.failed or no gen) are eligible. When ineligible we emit no left
+    // action AND flag the wrapper so the gesture handler suppresses right-swipe.
+    var canQuickSell = (i.status !== STATUS.SOLD) && (i.gen !== "pending");
+    var sellAction = canQuickSell
+      ? '<button class="inv-swipe-action sell" type="button" data-swipe-action="sell" data-item="' + i.id + '" tabindex="-1">Sold</button>'
+      : '';
     return '' +
-      '<div class="inv-swipe-wrap" data-swipe-wrap="' + i.id + '">' +
+      '<div class="inv-swipe-wrap" data-swipe-wrap="' + i.id + '"' +
+        (canQuickSell ? ' data-can-sell="1"' : '') + '>' +
+        sellAction +
         action +
         '<button class="inv-row" data-item="' + i.id + '">' +
           thumbHTML(i, "inv-thumb") +
@@ -4927,6 +5213,9 @@
   const SWIPE_THRESHOLD_PX = 45;  // past this on release -> snap open
   const SWIPE_INTENT_PX = 10;     // horizontal travel before we claim the gesture
   let openSwipeRow = null;        // the currently-open .inv-row element, or null
+  // SPE-28: swipe is now bidirectional. The open row also records WHICH direction
+  // it opened in via row._swipeDir: -1 = left drawer (Delete/View on the right,
+  // row translated -88px), +1 = right drawer (Sold on the left, row +88px).
 
   function setRowOffset(row, px, snap) {
     if (!row) return;
@@ -4937,13 +5226,17 @@
     if (openSwipeRow) {
       setRowOffset(openSwipeRow, 0, snap !== false);
       openSwipeRow._swipeOpen = false;
+      openSwipeRow._swipeDir = 0;
       openSwipeRow = null;
     }
   }
-  function openRowDrawer(row) {
+  // dir: -1 opens the LEFT drawer (delete/view), +1 opens the RIGHT drawer (sold).
+  function openRowDrawer(row, dir) {
+    var d = (dir > 0) ? 1 : -1;
     if (openSwipeRow && openSwipeRow !== row) closeSwipeRow(true);
-    setRowOffset(row, -SWIPE_OPEN_PX, true);
+    setRowOffset(row, d * SWIPE_OPEN_PX, true);
     row._swipeOpen = true;
+    row._swipeDir = d;
     openSwipeRow = row;
   }
 
@@ -4951,7 +5244,7 @@
     // A render just replaced the DOM; any previously-open row element is detached.
     if (openSwipeRow && !document.body.contains(openSwipeRow)) openSwipeRow = null;
 
-    // Action-button taps (Delete / View) behind the rows.
+    // Action-button taps behind the rows: Delete / View (right edge) or Sold (left).
     el.querySelectorAll(".inv-swipe-action").forEach(function (btn) {
       btn.addEventListener("click", function (ev) {
         ev.preventDefault();
@@ -4959,7 +5252,10 @@
         const id = btn.getAttribute("data-item");
         const kind = btn.getAttribute("data-swipe-action");
         closeSwipeRow(false);
-        if (kind === "view") {
+        if (kind === "sell") {
+          // SPE-28: right-swipe quick-sell -> open the bottom sheet.
+          openQuickSell(id);
+        } else if (kind === "view") {
           // Bundled-sold item: route to detail (guarded bundle flow lives there).
           jumpToItemDetail(id);
         } else {
@@ -4969,6 +5265,11 @@
     });
 
     el.querySelectorAll(".inv-row").forEach(function (row) {
+      // SPE-28: whether this row can be quick-sold (right-swipe). The wrapper carries
+      // data-can-sell for eligible rows; ineligible rows get NO right drawer.
+      const wrap = row.closest(".inv-swipe-wrap");
+      const canSell = !!(wrap && wrap.getAttribute("data-can-sell") === "1");
+
       let startX = 0, startY = 0;
       let dragging = false;      // gesture claimed (horizontal intent confirmed)
       let decided = false;       // intent decision made for this pointer
@@ -4980,7 +5281,9 @@
         if (e.button && e.button !== 0) return;
         startX = e.clientX; startY = e.clientY;
         dragging = false; decided = false;
-        baseOffset = row._swipeOpen ? -SWIPE_OPEN_PX : 0;
+        // SPE-28: start from the row's current resting offset in whichever direction
+        // it's open (dir -1 => -88, +1 => +88, closed => 0).
+        baseOffset = row._swipeOpen ? (row._swipeDir * SWIPE_OPEN_PX) : 0;
         pointerId = e.pointerId;
         row.classList.remove("swipe-snap");   // follow finger 1:1
       });
@@ -4993,23 +5296,28 @@
           // Wait for a clear signal before committing either way.
           if (Math.abs(dx) < SWIPE_INTENT_PX && Math.abs(dy) < SWIPE_INTENT_PX) return;
           decided = true;
-          // Horizontal-left intent (and not dominated by vertical) -> claim it.
-          if (dx < -SWIPE_INTENT_PX && Math.abs(dx) > Math.abs(dy)) {
+          const horizontal = Math.abs(dx) > Math.abs(dy);
+          // Left intent: always claimable (reveal Delete/View, or close a right drawer).
+          if (dx < -SWIPE_INTENT_PX && horizontal) {
             dragging = true;
             try { row.setPointerCapture(pointerId); } catch (_) {}
-          } else if (baseOffset !== 0 && dx > SWIPE_INTENT_PX && Math.abs(dx) > Math.abs(dy)) {
-            // Swiping an already-open row back to the right -> also our gesture.
+          // Right intent: claim it if the row can quick-sell OR is already open
+          // (dragging an open drawer back closed always belongs to us).
+          } else if (dx > SWIPE_INTENT_PX && horizontal && (canSell || baseOffset !== 0)) {
             dragging = true;
             try { row.setPointerCapture(pointerId); } catch (_) {}
           } else {
-            // Vertical / rightward-on-closed -> let the page scroll; bail out.
+            // Vertical / a direction with no action available -> let the page scroll.
             return;
           }
         }
         if (!dragging) return;
         e.preventDefault();
+        // Clamp: left is always allowed (down to -MAX); right is allowed only when the
+        // row can quick-sell (up to +MAX), else pinned at 0 so it can't over-drag.
         let next = baseOffset + dx;
-        if (next > 0) next = 0;
+        const maxRight = canSell ? SWIPE_MAX_PX : 0;
+        if (next > maxRight) next = maxRight;
         if (next < -SWIPE_MAX_PX) next = -SWIPE_MAX_PX;
         setRowOffset(row, next, false);
       });
@@ -5025,7 +5333,9 @@
         row._swipeSuppressClick = true;
         const dx = (e ? e.clientX : startX) - startX;
         const curOffset = baseOffset + dx;
-        if (curOffset <= -SWIPE_THRESHOLD_PX) openRowDrawer(row);
+        // Snap to whichever drawer we're past the threshold toward; else close.
+        if (curOffset <= -SWIPE_THRESHOLD_PX) openRowDrawer(row, -1);
+        else if (canSell && curOffset >= SWIPE_THRESHOLD_PX) openRowDrawer(row, 1);
         else closeSwipeRow(true);
       }
       row.addEventListener("pointerup", endGesture);
@@ -5036,7 +5346,7 @@
         const wasDragging = dragging;
         pointerId = null; dragging = false; decided = false;
         if (wasDragging) { row._swipeSuppressClick = true; }
-        if (row._swipeOpen) openRowDrawer(row); else closeSwipeRow(true);
+        if (row._swipeOpen) openRowDrawer(row, row._swipeDir); else closeSwipeRow(true);
       });
     });
   }
@@ -5562,7 +5872,8 @@
               '<input id="salerFee" type="number" inputmode="decimal" step="0.01" min="0" ' +
                 'value="' + escapeHtml(sf.fee) + '" placeholder="0.00" /></div></div>' +
           '</div>' +
-          '<div class="helper">Enter the platform’s cut (shipping/selling fees) so profit is accurate.</div>' +
+          // SPE-28: fee auto-suggest hint line (shared feeHint helper).
+          '<div class="helper" id="salerFeeHint">' + escapeHtml(feeHint(sf.platform)) + '</div>' +
           '<button class="btn" type="button" data-act="sale-confirm">Confirm sale</button>' +
           '<button class="btn secondary" type="button" data-act="sale-cancel" style="margin-top:10px;">Cancel</button>' +
         '</div>';
@@ -5698,14 +6009,33 @@
     // store-driven re-render (should one happen) can't clobber typed values.
     // These are plain UI-scratch fields (not store data), so no store write here.
     if (invState.saleForm && invState.saleForm.itemId === id) {
-      const bind = function (elId, key) {
-        const inp = document.getElementById(elId);
-        if (inp) inp.addEventListener("input", function () { invState.saleForm[key] = inp.value; });
+      // SPE-28: re-derive the auto-suggested fee from price+platform UNLESS the user
+      // hand-edited fee (feeTouched). Updates the field + hint without a full
+      // re-render so the caret isn't disturbed. Mirrors quickSellRefreshFee.
+      const refreshFee = function () {
+        const hint = document.getElementById("salerFeeHint");
+        if (hint) hint.textContent = feeHint(invState.saleForm.platform);
+        if (invState.saleForm.feeTouched) return;
+        const suggested = suggestFee(invState.saleForm.platform, invState.saleForm.price).toFixed(2);
+        invState.saleForm.fee = suggested;
+        const feeInput = document.getElementById("salerFee");
+        if (feeInput) feeInput.value = suggested;
       };
-      bind("salerPrice", "price");
-      bind("salerFee", "fee");
+      const price = document.getElementById("salerPrice");
+      if (price) price.addEventListener("input", function () {
+        invState.saleForm.price = price.value;
+        refreshFee();
+      });
+      const fee = document.getElementById("salerFee");
+      if (fee) fee.addEventListener("input", function () {
+        invState.saleForm.fee = fee.value;
+        invState.saleForm.feeTouched = true;   // stop auto-recompute
+      });
       const plat = document.getElementById("salerPlatform");
-      if (plat) plat.addEventListener("change", function () { invState.saleForm.platform = plat.value; });
+      if (plat) plat.addEventListener("change", function () {
+        invState.saleForm.platform = plat.value;
+        refreshFee();
+      });
     }
 
     // Status + sale + delete actions.
@@ -5748,7 +6078,14 @@
           const cur = AppStore.getItem(id);
           const suggested = (cur && cur.listing && cur.listing.suggestedPrice)
             ? numOrEmpty(cur.listing.suggestedPrice) : "";
-          invState.saleForm = { itemId: id, price: suggested, platform: PLATFORMS[0], fee: "0" };
+          // SPE-28: preselect the last-used platform and auto-suggest the fee from
+          // it (shared helpers). feeTouched starts false so it recomputes until the
+          // user edits fee. Same suggest-until-manually-edited logic as quick-sell.
+          const platform = LastPlatform.get();
+          invState.saleForm = {
+            itemId: id, price: suggested, platform: platform,
+            fee: suggestFee(platform, suggested).toFixed(2), feeTouched: false
+          };
           invState.saleDone = null;
           renderInventory();
         } else if (act === "sale-cancel") {
@@ -5813,6 +6150,7 @@
       bundleId: null
     };
     const profit = sale.price - (Number(item.costPaid) || 0) - sale.fee;
+    LastPlatform.set(sale.platform);   // SPE-28: remember for both sale forms
     invState.saleForm = null;
     invState.saleDone = { itemId: id, profit: profit };
     AppStore.updateItem(id, { sale: sale, status: STATUS.SOLD }); // notify -> re-render shows success moment
@@ -6180,9 +6518,11 @@
     // SPE-21: tapping the "N researching" pill jumps to Inventory.
     const pill = document.getElementById("genPill");
     if (pill) pill.addEventListener("click", function () { Router.go("inventory"); });
-    // Close the settings modal with Escape.
+    // Close the settings modal (or the SPE-28 quick-sell sheet) with Escape.
     document.addEventListener("keydown", function (e) {
-      if (e.key === "Escape" && settingsState.open) closeSettings();
+      if (e.key !== "Escape") return;
+      if (quickSellState.open) closeQuickSell();
+      else if (settingsState.open) closeSettings();
     });
 
     // Intake flow (SPE-6..9) is rendered by renderAdd() into #addFlow and wires
@@ -6260,14 +6600,23 @@
         swipeDeleteItem: swipeDeleteItem,
         restoreSwipedItem: restoreSwipedItem,
         showUndoToast: showUndoToast,
-        getOpenSwipeRow: function () { return openSwipeRow; }
+        getOpenSwipeRow: function () { return openSwipeRow; },
+        // SPE-28: quick-sell seams for the verification harness.
+        openQuickSell: openQuickSell,
+        closeQuickSell: closeQuickSell,
+        onConfirmQuickSell: onConfirmQuickSell,
+        quickSellState: quickSellState,
+        suggestFee: suggestFee,
+        feeHint: feeHint,
+        LastPlatform: LastPlatform,
+        LAST_PLATFORM_STORAGE: LAST_PLATFORM_STORAGE
       };
     }
 
     // Load persisted data + the API key (SPE-19) + cloud settings (SPE-25) in
     // parallel, then paint. The key/cloud load determines the AI mode shown in the
     // intake/loading copy and Settings, and whether cloud jobs resume.
-    Promise.all([AppStore.load(), ApiKey.load(), CloudSettings.load()]).then(function () {
+    Promise.all([AppStore.load(), ApiKey.load(), CloudSettings.load(), LastPlatform.load()]).then(function () {
       // SPE-25 (boot path, cloud): resume POLLING any cloud job that was in flight
       // before the app was killed (item.genJob persisted, gen still "pending"). This
       // is the headline reload-survival feature. Must run AFTER CloudSettings.load()
