@@ -1,0 +1,9 @@
+# Copy to `.dev.vars` for local `wrangler dev`. `.dev.vars` is gitignored.
+# In production these are set as SECRETS (wrangler secret put / dashboard), NOT here.
+
+APP_TOKEN="local-dev-token"
+ANTHROPIC_API_KEY="sk-ant-REPLACE-ME"
+
+# TEST_MODE=1 makes the job processor return a canned draft after ~2s instead of
+# calling Anthropic. MUST be unset (or not "1") in production.
+TEST_MODE="1"

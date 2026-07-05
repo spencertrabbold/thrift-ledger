@@ -1,0 +1,44 @@
+{
+  // Cloudflare Worker for Thrift Ledger — SPE-25.
+  // Runs AI listing-generation jobs detached from the phone (iOS backgrounds the
+  // page and kills in-flight fetches). Job processing lives in a SQLite-backed
+  // Durable Object so the long Anthropic call keeps running server-side and the
+  // result is persisted for later pickup.
+  //
+  // Docs: https://developers.cloudflare.com/durable-objects/
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "thrift-ledger-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2025-06-01",
+
+  // Durable Objects binding. JobRunner is the single class that owns a job's
+  // storage + alarm-driven processing.
+  "durable_objects": {
+    "bindings": [
+      { "name": "JOB_RUNNER", "class_name": "JobRunner" }
+    ]
+  },
+
+  // SQLite-backed Durable Objects are the ONLY DO class available on the Workers
+  // FREE plan, so the migration MUST use new_sqlite_classes (not new_classes).
+  // Docs: https://developers.cloudflare.com/durable-objects/platform/pricing/
+  //       https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["JobRunner"]
+    }
+  ],
+
+  // Non-secret vars. Secrets (ANTHROPIC_API_KEY, APP_TOKEN) are NOT declared here
+  // with values — set them via `wrangler secret put` or the dashboard (see README).
+  // TEST_MODE must be UNSET in production; when "1" the job processor returns a
+  // canned draft after ~2s instead of calling Anthropic.
+  "vars": {
+    // (intentionally empty in production — override locally via .dev.vars)
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}
