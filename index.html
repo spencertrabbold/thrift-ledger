@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- app-version: 2026-07-05.1 -->
+<!-- app-version: 2026-07-05.2 -->
 <!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
      constant (search for `const APP_VERSION =`) MUST stay identical. The
      orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
@@ -1055,14 +1055,14 @@
      [APP VERSION]  — SPE-23. Single source of truth for the deployed build id.
      ---------------------------------------------------------------------------
      THIS CONSTANT AND THE HTML MARKER COMMENT NEAR THE TOP OF THE FILE
-     (`<!-- app-version: 2026-07-05.1 -->`) MUST STAY IDENTICAL. The orchestrator
+     (`<!-- app-version: 2026-07-05.2 -->`) MUST STAY IDENTICAL. The orchestrator
      bumps BOTH on every deploy. UpdateCheck fetches the live page, reads the
      marker, and compares it to this constant to detect a stale cached build (the
      root cause of SPE-23: iOS served an old cached build whose pre-SPE-22 error
      copy proved the page was stale). appVersion is also stamped into every AI
      debug snapshot so failure reports say which build produced them.
      =========================================================================== */
-  const APP_VERSION = "2026-07-05.1";
+  const APP_VERSION = "2026-07-05.2";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -1603,6 +1603,12 @@
         "   - mercari: concise and to the point.",
         "   - depop: lowercase, casual, trend-aware, include #hashtags.",
         "",
+        "OUTPUT RULES (STRICT):",
+        "- Write all text using actual characters — real emoji (😊 not unicode escape codes), real punctuation.",
+        "- Never write escape sequences like \\u, \\t, \\n as visible text. No tabs. No markdown.",
+        "- Titles must be plain product titles under 80 characters — never explanations, notes,",
+        "  or fragments of your research.",
+        "",
         "RESPOND WITH ONLY a single JSON object, no prose, no markdown fences, matching EXACTLY:",
         '{',
         '  "title": string,',
@@ -1707,6 +1713,21 @@
       return obj;
     }
 
+    // SPE-24 fix 1: the LAST text block of a terminal response. When structured
+    // outputs are in effect this block is the schema-constrained JSON — the ONLY
+    // block we should trust, because parseResponse() concatenates every text block
+    // (including research prose that can contain JSON-ish fragments) and brace-scans,
+    // which is exactly how the Calia-style garbage title got in. Returns the text
+    // string of the final text block, or null if there is none.
+    function lastTextBlock(response) {
+      if (!response || !Array.isArray(response.content)) return null;
+      for (let i = response.content.length - 1; i >= 0; i--) {
+        const b = response.content[i];
+        if (b && b.type === "text" && typeof b.text === "string") return b.text;
+      }
+      return null;
+    }
+
     async function generateBuiltin(payload) {
       const text = await window.claude.complete(buildPrompt(payload, false));
       return parseResponse(text);
@@ -1735,6 +1756,15 @@
     // sending it for the rest of the session. Independent of structuredOutputsBroken:
     // a 400 naming "format" drops format; a 400 naming "effort" drops effort.
     let effortBroken = false;
+
+    // SPE-24 fix 5: diagnostics from the most recent successful API extraction
+    // (extractionPath / formatSent / effortSent / stopReason / continuations /
+    // elapsedMs). generateApi sets it just before returning the draft; generate()
+    // clears it at the start of each call so a stale record can't leak into a later
+    // builtin/mock success. GenQueue reads it via getLastGenDiag() to build the
+    // lastSuccess debug record.
+    let lastGenDiag = null;
+    function getLastGenDiag() { return lastGenDiag; }
 
     // SPE-22 test seam. Tests import/override the timeout constants without shipping
     // shortened values. Not part of the production flow.
@@ -1854,16 +1884,27 @@
     // inspect WHICH field the 400 names — a 400 naming "effort" is handled by
     // isEffortError below and drops effort independently, so a format-only fallback
     // doesn't accidentally fire on an effort 400 (and vice versa).
+    // SPE-24 fix 2: NARROWED. Previously any 400 body containing "format" tripped
+    // structuredOutputsBroken for the whole session — far too broad (a validation
+    // error mentioning a "format" of some unrelated field would wrongly disable
+    // structured outputs). Now we require the body to name output_config
+    // specifically, which is where our format lives. Logs a warn when it trips
+    // (done at the call site).
     function isOutputConfigError(err) {
       if (!err || err.apiStatus !== 400) return false;
-      const body = (err.apiBody || "").toLowerCase();
-      return body.indexOf("output_config") !== -1 || body.indexOf("format") !== -1;
+      return /output_config/i.test(err.apiBody || "");
     }
-    // SPE-22: does this 400 name "effort"? Drops effort for the session (independent
-    // of the structured-outputs fallback).
+    // SPE-22 / SPE-24 fix 2: does this 400 name "effort" AND clearly point at our
+    // output_config? Effort lives inside output_config, so a bare "effort" mention
+    // anywhere in the body is not enough — we require /effort/i AND either
+    // output_config is also named or the error's param path names effort
+    // (e.g. "output_config.effort"). Drops effort for the session (independent of
+    // the structured-outputs fallback).
     function isEffortError(err) {
       if (!err || err.apiStatus !== 400) return false;
-      return (err.apiBody || "").toLowerCase().indexOf("effort") !== -1;
+      const body = (err.apiBody || "");
+      if (!/effort/i.test(body)) return false;
+      return /output_config/i.test(body) || /output_config\.effort|["']?effort["']?\s*(?:field|param|parameter|:)/i.test(body);
     }
 
     // SPE-22: request metadata attached to EVERY debug snapshot so a failure report
@@ -1878,10 +1919,60 @@
       };
     }
 
+    // SPE-24 fix 5: the debug blob is now an OBJECT with two independent slots:
+    //   { lastFailure: {...}|null, lastSuccess: {...}|null }
+    // so a success record doesn't wipe the last failure and vice versa (the field
+    // team needs both to tell whether structured outputs are actually driving
+    // results). We keep an in-memory cache so the async read-modify-write can't lose
+    // the other slot under back-to-back writes. All fire-and-forget; never throws;
+    // never contains the API key.
+    let debugCache = null;   // { lastFailure, lastSuccess } once loaded/written
+    function ensureDebugCache() {
+      if (debugCache) return Promise.resolve(debugCache);
+      return Storage.get(AI_DEBUG_STORAGE).then(function (v) {
+        if (v && typeof v === "object" && ("lastFailure" in v || "lastSuccess" in v)) {
+          debugCache = { lastFailure: v.lastFailure || null, lastSuccess: v.lastSuccess || null };
+        } else if (v && typeof v === "object") {
+          // Legacy flat snapshot (pre-SPE-24): treat it as the last failure.
+          debugCache = { lastFailure: v, lastSuccess: null };
+        } else {
+          debugCache = { lastFailure: null, lastSuccess: null };
+        }
+        return debugCache;
+      }).catch(function () {
+        debugCache = { lastFailure: null, lastSuccess: null };
+        return debugCache;
+      });
+    }
+    function writeDebugSlot(slot, snapshot) {
+      // slot: "lastFailure" | "lastSuccess". Merge into the cache, then persist the
+      // whole object. Guard everything — debug capture must never break the flow.
+      try {
+        ensureDebugCache().then(function (cache) {
+          try {
+            cache[slot] = snapshot;
+            Storage.set(AI_DEBUG_STORAGE, { lastFailure: cache.lastFailure || null, lastSuccess: cache.lastSuccess || null });
+          } catch (_) {}
+        }).catch(function () {});
+      } catch (_) {}
+    }
+
+    // SPE-24 fix 5: record a compact success snapshot alongside any lastFailure.
+    function recordSuccess(fields) {
+      try {
+        const snapshot = Object.assign(
+          { when: new Date().toISOString(), appVersion: APP_VERSION },
+          fields || {}
+        );
+        writeDebugSlot("lastSuccess", snapshot);
+      } catch (_) { /* never throw */ }
+    }
+
     // SPE-20/22: persist a redacted debug snapshot of a failed/rejected generation so
-    // the user can copy it back to the developer. Overwrites each time; the API
-    // key is never part of `response`/`meta`, so nothing sensitive is stored.
-    // This is the RICH parse/empty-draft path — it keeps the response content dump.
+    // the user can copy it back to the developer. Overwrites the lastFailure slot
+    // each time; the API key is never part of `response`/`meta`, so nothing
+    // sensitive is stored. This is the RICH parse/empty-draft path — it keeps the
+    // response content dump.
     function captureAiDebug(response, meta) {
       try {
         const content = (response && Array.isArray(response.content)) ? response.content : [];
@@ -1903,7 +1994,7 @@
           request: meta || null
         };
         // Fire-and-forget; storage is async and failure here must not break the flow.
-        Storage.set(AI_DEBUG_STORAGE, snapshot);
+        writeDebugSlot("lastFailure", snapshot);
       } catch (_) { /* debug capture must never throw */ }
     }
 
@@ -1917,7 +2008,7 @@
           fields || {},
           { request: meta || null }
         );
-        Storage.set(AI_DEBUG_STORAGE, snapshot);
+        writeDebugSlot("lastFailure", snapshot);
       } catch (_) { /* debug capture must never throw */ }
     }
 
@@ -1960,6 +2051,7 @@
       let response = null;
       const meta = requestMeta(useStructured, useEffort ? API_EFFORT : null);
       const loopStart = Date.now();
+      let continuations = 0;   // SPE-24 fix 5: how many pause_turn continuations ran
 
       for (let attempt = 0; attempt <= API_MAX_CONTINUATIONS; attempt++) {
         const phase = attempt === 0 ? "initial" : ("continuation-" + attempt);
@@ -2028,6 +2120,7 @@
             throw new Error("The AI took too long researching prices. Try again.");
           }
           messages.push({ role: "assistant", content: response.content });
+          continuations++;
           continue;
         }
         if (stop === "max_tokens") {
@@ -2045,11 +2138,18 @@
       }
       // Return a synthetic response whose content is the accumulated blocks so
       // parseResponse + debug capture see every text block from the whole turn.
+      // SPE-24: also surface the terminal response separately (fix 1 parses ONLY
+      // its last text block when structured outputs were in effect) plus the flags
+      // and continuation count needed for success diagnostics (fix 5).
       return {
         stop_reason: response.stop_reason,
         content: accumulated,
         _terminal: response,
-        _meta: meta
+        _meta: meta,
+        _formatSent: !!useStructured,
+        _effortSent: useEffort ? API_EFFORT : null,
+        _continuations: continuations,
+        _elapsedMs: Date.now() - loopStart
       };
     }
 
@@ -2080,11 +2180,13 @@
           // the matching session flag so later generations skip it. The two flags
           // are independent.
           if (tries < 2 && useEffort && isEffortError(err)) {
+            console.warn("[AIListing] effortBroken tripped — dropping output_config.effort for this session. 400 body:", (err.apiBody || "").slice(0, 300));
             effortBroken = true;
             useEffort = false;
             continue;
           }
           if (tries < 2 && useStructured && isOutputConfigError(err)) {
+            console.warn("[AIListing] structuredOutputsBroken tripped — dropping output_config.format for this session. 400 body:", (err.apiBody || "").slice(0, 300));
             structuredOutputsBroken = true;
             useStructured = false;
             continue;
@@ -2093,15 +2195,54 @@
         }
       }
 
-      try {
-        return parseResponse(result.content);
-      } catch (parseErr) {
-        // Couldn't extract a listing from the accumulated text — snapshot (rich,
-        // with request metadata) for the user to report, then rethrow so the UI
-        // shows the error/retry step.
-        captureAiDebug(result, result && result._meta);
-        throw parseErr;
+      // SPE-24 fix 1: PRECISE parsing when structured outputs were in effect.
+      // If format was sent AND the terminal response ended cleanly (end_turn), the
+      // schema-constrained JSON is exactly the LAST text block of the terminal
+      // response. Parse ONLY that block first — it can't be polluted by research
+      // prose in earlier blocks. Only if that fails do we fall back to the
+      // accumulated-blocks brace-scan (the old, pollutable path). We record which
+      // path produced the draft for success diagnostics (fix 5).
+      const terminal = result._terminal || result;
+      const terminalEndTurn = terminal && terminal.stop_reason === "end_turn";
+      let draft = null;
+      let extractionPath = null;
+
+      if (result._formatSent && terminalEndTurn) {
+        const finalText = lastTextBlock(terminal);
+        if (finalText != null) {
+          try {
+            draft = parseResponse(finalText);
+            extractionPath = "structured-final-block";
+          } catch (_) {
+            draft = null;   // fall through to the accumulated-blocks fallback
+          }
+        }
       }
+
+      if (!draft) {
+        try {
+          draft = parseResponse(result.content);
+          extractionPath = "accumulated-fallback";
+        } catch (parseErr) {
+          // Couldn't extract a listing from the accumulated text — snapshot (rich,
+          // with request metadata) for the user to report, then rethrow so the UI
+          // shows the error/retry step.
+          captureAiDebug(result, result && result._meta);
+          throw parseErr;
+        }
+      }
+
+      // SPE-24 fix 5: stash the extraction diagnostics for GenQueue to fold into
+      // the lastSuccess record once the draft is accepted (post-sanitation).
+      lastGenDiag = {
+        extractionPath: extractionPath,
+        formatSent: !!result._formatSent,
+        effortSent: result._effortSent || null,
+        stopReason: (terminal && terminal.stop_reason) || null,
+        continuations: (typeof result._continuations === "number") ? result._continuations : 0,
+        elapsedMs: (typeof result._elapsedMs === "number") ? result._elapsedMs : null
+      };
+      return draft;
     }
 
     // Minimal real request used by the Settings "Test" button. Small, no tools,
@@ -2157,6 +2298,7 @@
     }
 
     async function generate(payload) {
+      lastGenDiag = null;   // SPE-24 fix 5: only the API path sets this; clear per call
       const m = mode();
       if (m === "builtin") return generateBuiltin(payload);
       if (m === "api") return generateApi(payload);
@@ -2172,9 +2314,9 @@
       // path (in the add flow). captureRawDebug builds a snapshot from a plain
       // draft object for the non-API (builtin/mock) validation-failure case.
       captureAiDebug: captureAiDebug,
-      captureRawDebug: function (draft, stopReason) {
+      captureRawDebug: function (draft, stopReason, extraFields) {
         try {
-          Storage.set(AI_DEBUG_STORAGE, {
+          writeDebugSlot("lastFailure", Object.assign({
             when: new Date().toISOString(),
             appVersion: APP_VERSION,          // SPE-23: which build produced this failure
             kind: "empty_draft",
@@ -2184,9 +2326,12 @@
               try { return JSON.stringify(draft).slice(0, 20000); }
               catch (_) { return ""; }
             })()
-          });
+          }, extraFields || {}));
         } catch (_) { /* never throw */ }
       },
+      // SPE-24 fix 5: success diagnostics.
+      recordSuccess: recordSuccess,
+      getLastGenDiag: getLastGenDiag,
       // SPE-22 test seam: exposed so the verification harness can drive the direct-
       // API path (generateApi/buildApiBody) and monkeypatch the timeout constants
       // WITHOUT shipping shortened values. Not used by the production flow.
@@ -2236,7 +2381,7 @@
     let fetchImpl = (typeof fetch !== "undefined") ? fetch.bind(window) : null;
 
     // Pull the app-version marker out of fetched page text. Same token the HTML
-    // marker uses: `app-version: 2026-07-05.1`.
+    // marker uses: `app-version: 2026-07-05.2`.
     function parseVersion(text) {
       if (typeof text !== "string") return null;
       const m = text.match(/app-version:\s*([\w.\-]+)/);
@@ -2443,10 +2588,28 @@
       return (it && it.createdAt) ? it.createdAt : Date.now();
     }
 
-    // SPE-23: how long we wait before the single silent auto-retry of a transient
+    // SPE-23/SPE-24: how long we wait before a silent auto-retry of a transient
     // failure. Module-level `let` so tests can scale it down without shipping the
-    // shortened value (via __setRetryDelay).
+    // shortened value (via __setRetryDelay). RETRY_DELAY_MS is the base still used
+    // by the quality-regen path.
     let RETRY_DELAY_MS = 3000;
+
+    // SPE-24 fix 6: 529/overload patience. We now allow TWO transient auto-retries
+    // (was one) with escalating backoff: 10s then 30s. A 529 (Anthropic overloaded)
+    // ALWAYS uses the longer 30s backoff regardless of which retry it is. These stay
+    // within the 480s overall budget: worst case 3 attempts (~180s cap each is
+    // itself budgeted inside runApiLoop) plus 10s+30s of backoff. Module-level `let`
+    // so tests can scale them via __setBackoffs without shipping shortened values.
+    let MAX_TRANSIENT_RETRIES = 2;
+    let TRANSIENT_BACKOFF_MS = [10000, 30000];   // [before retry 1, before retry 2]
+    let OVERLOAD_BACKOFF_MS = 30000;             // 529 always waits this long
+
+    // Backoff (ms) to wait before transient retry N (1-based), given the error.
+    function transientBackoff(retryN, err) {
+      if (err && err.kind === "http" && err.apiStatus === 529) return OVERLOAD_BACKOFF_MS;
+      const idx = Math.min(retryN - 1, TRANSIENT_BACKOFF_MS.length - 1);
+      return TRANSIENT_BACKOFF_MS[idx];
+    }
 
     // SPE-23: is this failure TRANSIENT (worth one silent auto-retry) vs. terminal
     // (fail immediately)? The SPE-22 error objects carry `kind` ("timeout" |
@@ -2497,30 +2660,80 @@
     // Run one generation. Never throws to the caller; resolves the item's gen
     // field one way or the other and always frees the slot + pumps the queue.
     // SPE-23: `attempt` is 0 for the first try, 1 for the single auto-retry.
-    function run(itemId, attempt) {
+    // SPE-24 fix 4: max quality-driven regenerations per generation (avoid loops).
+    const MAX_QUALITY_REGENS = 1;
+
+    function run(itemId, attempt, qualityRegens) {
       attempt = attempt || 0;
+      qualityRegens = qualityRegens || 0;
       active.add(itemId);
       const item = AppStore.getItem(itemId);
       const payload = payloadFor(item);
 
       AIListing.generate(payload).then(function (draft) {
-        finishSuccess(itemId, draft);
+        // SPE-24 fix 5: grab extraction diagnostics BEFORE anything async can
+        // overwrite them (getLastGenDiag reflects only the last generate() call).
+        const diag = (typeof AIListing.getLastGenDiag === "function") ? AIListing.getLastGenDiag() : null;
+
+        // SPE-24 fix 4: sanitize, then check for garbage. normalizeDraft happens
+        // inside sanitizeDraft; isDraftUsable is the existing empty-draft safety net.
+        const clean = sanitizeDraft(draft);
+
+        if (!isDraftUsable(clean)) {
+          // Empty even after sanitation — existing SPE-20 safety net (failure path).
+          delete startedAt[itemId];
+          if (!AppStore.getItem(itemId)) { settle(itemId); return; }
+          AIListing.captureRawDebug(draft, "empty_draft");
+          markFailed(itemId, "The AI returned an empty draft — tap to retry");
+          settle(itemId);
+          return;
+        }
+
+        if (draftLooksBroken(clean)) {
+          if (qualityRegens < MAX_QUALITY_REGENS &&
+              AppStore.getItem(itemId) && AppStore.getItem(itemId).gen === "pending") {
+            // Silent quality-regen: treat like a transient retry (no toast, gen
+            // stays "pending"). Counts against the quality budget (max 1).
+            console.warn("[GenQueue] draft failed quality check — auto-regenerating once (quality regen).");
+            active.delete(itemId);
+            setTimeout(function () {
+              const cur = AppStore.getItem(itemId);
+              if (!cur || cur.gen !== "pending") { pump(); return; }
+              run(itemId, attempt, qualityRegens + 1);
+            }, RETRY_DELAY_MS);
+            return;   // the regen owns the lifecycle
+          }
+          // Regen budget spent (or item gone): ACCEPT the (still-broken) draft so she
+          // can edit it — never trap her behind an error — but flag it: capture a
+          // quality debug snapshot with the offending fields.
+          captureQualityDebug(draft, clean);
+          finishSuccess(itemId, clean, diag, qualityRegens, true);
+          settle(itemId);
+          return;
+        }
+
+        // Clean draft — accept it.
+        finishSuccess(itemId, clean, diag, qualityRegens, false);
         settle(itemId);
       }).catch(function (err) {
-        // SPE-23: one silent auto-retry on a TRANSIENT failure. A fresh attempt
+        // SPE-23/SPE-24 fix 6: up to TWO silent auto-retries on a TRANSIENT failure
+        // with escalating backoff (10s then 30s; 529 always 30s). A fresh attempt
         // with its own budget — no toast, no intermediate {failed} state written,
         // gen stays "pending" so the research panel keeps showing. Free this slot
         // first so the retry (and other queued items) can schedule fairly.
-        if (attempt === 0 && isTransient(err) && AppStore.getItem(itemId) &&
+        if (attempt < MAX_TRANSIENT_RETRIES && isTransient(err) && AppStore.getItem(itemId) &&
             AppStore.getItem(itemId).gen === "pending") {
-          console.warn("[GenQueue] transient failure — auto-retrying once:", err && err.message);
+          const retryN = attempt + 1;                 // 1-based retry number
+          const backoff = transientBackoff(retryN, err);
+          console.warn("[GenQueue] transient failure — auto-retry " + retryN + "/" +
+            MAX_TRANSIENT_RETRIES + " in " + backoff + "ms:", err && err.message);
           active.delete(itemId);
           setTimeout(function () {
             // Re-check the item is still pending (not deleted / retried manually).
             const cur = AppStore.getItem(itemId);
             if (!cur || cur.gen !== "pending") { pump(); return; }
-            run(itemId, 1);
-          }, RETRY_DELAY_MS);
+            run(itemId, attempt + 1, qualityRegens);
+          }, backoff);
           return;   // do NOT settle now — the retry owns the lifecycle
         }
         // Terminal (non-transient, or the retry itself failed): mark failed + toast.
@@ -2529,28 +2742,68 @@
       });
     }
 
+    // SPE-24 fix 4: which fields tripped draftLooksBroken (for the quality debug).
+    function offendingFields(clean) {
+      const out = [];
+      const title = (clean && typeof clean.title === "string") ? clean.title : "";
+      const desc = (clean && typeof clean.description === "string") ? clean.description : "";
+      if (title.trim() === "") out.push("title:empty");
+      if (title.length > 120) out.push("title:too-long");
+      DRAFT_TITLE_GARBAGE.forEach(function (g) { if (title.indexOf(g) !== -1) out.push("title:contains:" + g); });
+      if (desc.trim().length < 20 && title.trim().length < 8) out.push("description:too-short");
+      const plats = (clean && clean.platforms) || {};
+      PLATFORMS.forEach(function (p) {
+        const v = plats[p];
+        if (typeof v !== "string" || v.trim().length < 25) out.push("platform:" + p + ":too-short");
+      });
+      const price = Number(clean && clean.suggestedPrice);
+      if (isNaN(price) || price <= 0 || price > 500) out.push("suggestedPrice:out-of-range");
+      return out;
+    }
+
+    // SPE-24 fix 4: capture a quality debug snapshot (kind:"quality") so we can study
+    // drafts that stayed broken after a regen. Redacted; never the API key.
+    function captureQualityDebug(rawDraft, clean) {
+      try {
+        AIListing.captureRawDebug(rawDraft, "quality", {
+          kind: "quality",
+          offendingFields: offendingFields(clean)
+        });
+      } catch (_) { /* never throw */ }
+    }
+
     // Free the slot for a settled job and pump the queue + resync the wake lock.
     function settle(itemId) {
       active.delete(itemId);
       pump();          // pump() calls syncWakeLock() at the end
     }
 
-    function finishSuccess(itemId, draft) {
+    // SPE-24: `clean` is an ALREADY sanitized + usability-checked draft (run() did
+    // that). `diag` is the API extraction diagnostics (or null for builtin/mock),
+    // `qualityRegens` how many quality regenerations ran, `wasBroken` whether we're
+    // accepting a still-broken draft (regen budget spent).
+    function finishSuccess(itemId, clean, diag, qualityRegens, wasBroken) {
       delete startedAt[itemId];   // SPE-22: research done — drop the elapsed anchor
       // Discard if the item was deleted while research ran.
       const item = AppStore.getItem(itemId);
       if (!item) return;
-      const normalized = normalizeDraft(draft);
-      // SPE-20 safety net: an empty draft (no title AND no platform text) means
-      // generation produced nothing usable — treat it as a failure, not a blank.
-      if (!isDraftUsable(normalized)) {
-        AIListing.captureRawDebug(draft, "empty_draft");
-        markFailed(itemId, "The AI returned an empty draft — tap to retry");
-        return;
-      }
       // Write listing, clear gen. Status stays 'draft' — she reviews before it
       // counts as listed (Mark as Listed lives in item detail now).
-      AppStore.updateItem(itemId, { listing: normalized, gen: null });
+      AppStore.updateItem(itemId, { listing: clean, gen: null });
+      // SPE-24 fix 5: record success diagnostics alongside any lastFailure.
+      try {
+        AIListing.recordSuccess({
+          extractionPath: (diag && diag.extractionPath) || (AIListing.mode() === "api" ? "unknown" : AIListing.mode()),
+          formatSent: diag ? !!diag.formatSent : false,
+          effortSent: diag ? (diag.effortSent || null) : null,
+          stopReason: diag ? (diag.stopReason || null) : null,
+          continuations: diag ? (diag.continuations || 0) : 0,
+          qualityRegens: qualityRegens || 0,
+          acceptedBroken: !!wasBroken,
+          elapsedMs: diag ? (diag.elapsedMs || null) : null,
+          mode: AIListing.mode()
+        });
+      } catch (_) {}
       const label = labelFor(AppStore.getItem(itemId));
       showGenToast("“" + label + "” listing ready — tap to review", itemId);
     }
@@ -2609,7 +2862,18 @@
       // SPE-23:
       resumeZombies: resumeZombies, hasLiveJob: hasLiveJob, requeue: requeue,
       isTransient: isTransient,
-      __setRetryDelay: function (ms) { if (typeof ms === "number") RETRY_DELAY_MS = ms; }
+      __setRetryDelay: function (ms) { if (typeof ms === "number") RETRY_DELAY_MS = ms; },
+      // SPE-24 fix 6 test seam: scale the backoff schedule + max retries for the
+      // verification harness WITHOUT shipping shortened values. Production ships
+      // MAX_TRANSIENT_RETRIES=2, TRANSIENT_BACKOFF_MS=[10000,30000], overload 30000.
+      __setBackoffs: function (arr, maxRetries, overloadMs) {
+        if (Array.isArray(arr) && arr.length) TRANSIENT_BACKOFF_MS = arr.slice();
+        if (typeof maxRetries === "number") MAX_TRANSIENT_RETRIES = maxRetries;
+        if (typeof overloadMs === "number") OVERLOAD_BACKOFF_MS = overloadMs;
+      },
+      __getBackoffs: function () {
+        return { schedule: TRANSIENT_BACKOFF_MS.slice(), max: MAX_TRANSIENT_RETRIES, overload: OVERLOAD_BACKOFF_MS };
+      }
     };
   })();
 
@@ -3415,6 +3679,133 @@
       }
     }
     return base;
+  }
+
+  /* ===========================================================================
+     SPE-24 fix 4 — post-parse sanitation + garbage detection.
+     ---------------------------------------------------------------------------
+     On-device evidence showed generated copy containing:
+       - literal emoji-escape residue: `ud83dude0a`, `u2728` (backslashes eaten)
+       - stray leading `t` from a mangled `\t`
+       - titles that were research prose / fragments / just `","`
+       - a fractional price like 22.261
+     sanitizeDraft() scrubs each string field; draftLooksBroken() flags a draft
+     that is still garbage after scrubbing so GenQueue can auto-regenerate once.
+     Both are pure — no DOM, no store — so they're unit-testable in-page.
+     =========================================================================== */
+
+  // Reconstruct the real character from a surrogate PAIR (e.g. "d83d","de0a" -> 😊)
+  // or a lone BMP codepoint ("2728" -> ✨). Returns the character, or "" if the
+  // hex doesn't form a plausible codepoint.
+  function reconstructFromHex(hi, lo) {
+    try {
+      if (hi && lo) {
+        const h = parseInt(hi, 16), l = parseInt(lo, 16);
+        if (h >= 0xd800 && h <= 0xdbff && l >= 0xdc00 && l <= 0xdfff) {
+          return String.fromCharCode(h, l);   // valid surrogate pair
+        }
+        return "";
+      }
+      if (hi) {
+        const cp = parseInt(hi, 16);
+        // Plausible standalone codepoint (skip lone surrogate halves — those are
+        // broken residue with nothing to pair, so drop them).
+        if (cp >= 0x20 && cp <= 0xffff && !(cp >= 0xd800 && cp <= 0xdfff)) {
+          return String.fromCharCode(cp);
+        }
+      }
+    } catch (_) {}
+    return "";
+  }
+
+  // Strip orphaned escape artifacts: `ud83dude0a`-style surrogate-pair residue
+  // (reconstruct the emoji), and standalone `uXXXX` hex (reconstruct or drop).
+  // Only touches sequences NOT preceded by a backslash (a real "\uXXXX" inside a
+  // JSON string was already decoded by JSON.parse; what's left here is visible-text
+  // residue from broken escaping) and NOT part of a longer word.
+  function stripEscapeResidue(s) {
+    if (typeof s !== "string" || !s) return s;
+    let out = s;
+    // Surrogate PAIR: u d[89ab]xx u d[cdef]xx  -> reconstruct to the real emoji.
+    out = out.replace(/(?<!\\)\bu(d[89ab][0-9a-f]{2})u(d[c-f][0-9a-f]{2})\b/gi, function (m, hi, lo) {
+      return reconstructFromHex(hi, lo) || "";
+    });
+    // Any remaining lone surrogate-half residue like `ud83d` with no partner -> drop.
+    out = out.replace(/(?<!\\)\bu(d[89ab][0-9a-f]{2})\b/gi, function () { return ""; });
+    // Standalone uXXXX (a plausible BMP codepoint) -> reconstruct the character.
+    out = out.replace(/(?<!\\)(?<!\w)u([0-9a-f]{4})\b/gi, function (m, hex) {
+      const ch = reconstructFromHex(hex, null);
+      return ch !== "" ? ch : m;   // leave it if it isn't a plausible codepoint
+    });
+    return out;
+  }
+
+  // Sanitize one string field. `isTitle` true => strip ALL control chars (tabs +
+  // newlines); otherwise keep newlines (paragraphs matter in descriptions / platform
+  // texts) but still drop tabs and other control chars.
+  function sanitizeString(s, isTitle) {
+    if (typeof s !== "string") return s;
+    let out = stripEscapeResidue(s);
+    if (isTitle) {
+      // Titles are single-line: ALL control chars (tabs/newlines/etc.) -> space.
+      out = out.replace(/[\x00-\x1f\x7f]+/g, " ");
+    } else {
+      // Keep newlines (\x0a) + CR (\x0d); drop tabs and other control chars. A
+      // mangled \t shows as a stray leading "t", but a genuine tab is possible too
+      // — turn tabs into a space, strip the rest.
+      out = out.replace(/\t+/g, " ").replace(/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]+/g, "");
+    }
+    // Collapse runs of spaces/tabs (but not newlines) into a single space.
+    out = out.replace(/[ \t]{2,}/g, " ");
+    if (isTitle) {
+      // Trim leading/trailing junk punctuation (commas, colons, periods, quotes,
+      // semicolons) plus surrounding whitespace.
+      out = out.replace(/^[\s"',:;.‘’“”]+/, "")
+               .replace(/[\s"',:;‘’“”]+$/, "")
+               .trim();
+    } else {
+      out = out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    }
+    return out;
+  }
+
+  // Sanitize an already-normalized draft (mutates a copy; returns it).
+  function sanitizeDraft(draft) {
+    const d = normalizeDraft(draft);   // guarantees shape even if given a raw obj
+    d.title = sanitizeString(d.title, true);
+    d.description = sanitizeString(d.description, false);
+    if (d.platforms && typeof d.platforms === "object") {
+      PLATFORMS.forEach(function (p) {
+        d.platforms[p] = sanitizeString(d.platforms[p], false);
+      });
+    }
+    // Round price to 2 decimals (22.261 -> 22.26). Keep "" if not numeric.
+    const sp = Number(d.suggestedPrice);
+    d.suggestedPrice = isNaN(sp) ? "" : Math.round(sp * 100) / 100;
+    return d;
+  }
+
+  // Heuristic: does a SANITIZED draft still look like garbage? Any one trips it.
+  // Substrings taken from the on-device Calia/research-prose evidence.
+  const DRAFT_TITLE_GARBAGE = ["<", "code_execution", "$ range", "Poshmark, and eBay", "http", "search result"];
+  function draftLooksBroken(draft) {
+    if (!draft || typeof draft !== "object") return true;
+    const title = typeof draft.title === "string" ? draft.title : "";
+    const desc = typeof draft.description === "string" ? draft.description : "";
+    if (title.trim() === "") return true;
+    if (title.length > 120) return true;
+    for (let i = 0; i < DRAFT_TITLE_GARBAGE.length; i++) {
+      if (title.indexOf(DRAFT_TITLE_GARBAGE[i]) !== -1) return true;
+    }
+    if (desc.trim().length < 20 && title.trim().length < 8) return true;
+    const plats = draft.platforms || {};
+    for (let i = 0; i < PLATFORMS.length; i++) {
+      const v = plats[PLATFORMS[i]];
+      if (typeof v !== "string" || v.trim().length < 25) return true;
+    }
+    const price = Number(draft.suggestedPrice);
+    if (isNaN(price) || price <= 0 || price > 500) return true;
+    return false;
   }
 
   function resetAddFlow() {
@@ -4782,7 +5173,23 @@
     // Tab bar clicks
     document.getElementById("tabBar").addEventListener("click", function (e) {
       const btn = e.target.closest("button[data-tab]");
-      if (btn) Router.go(btn.dataset.tab);
+      if (!btn) return;
+      const tab = btn.dataset.tab;
+      // SPE-24 fix 7: tapping the Inventory TAB always returns to the main list —
+      // even when we're already on the Inventory tab in item-detail mode. Clears the
+      // detail item + any transient detail flags and exits the bundle multi-select
+      // flow, but KEEPS the current filter chip. (jumpToItemDetail sets detail mode
+      // and calls Router.go directly, bypassing this handler, so deep-links still
+      // open detail.) The detail back-button behavior is untouched — it has its own
+      // handler in wireInventoryDetail.
+      if (tab === "inventory") {
+        invState.mode = "list";
+        invState.itemId = null;
+        resetDetailFlags();
+        exitBundleFlow();
+        invState.bundleDone = null;
+      }
+      Router.go(tab);
     });
 
     // Settings gear (SPE-19).
@@ -4851,7 +5258,14 @@
         AIListing: AIListing,
         AppStore: AppStore,
         resumeInterruptedOnBoot: resumeInterruptedOnBoot,
-        setAiModeAvailable: __setAiModeAvailable
+        setAiModeAvailable: __setAiModeAvailable,
+        // SPE-24: pure sanitation/detection helpers exposed for in-page unit checks.
+        sanitizeDraft: sanitizeDraft,
+        draftLooksBroken: draftLooksBroken,
+        normalizeDraft: normalizeDraft,
+        AI_DEBUG_STORAGE: AI_DEBUG_STORAGE,
+        Storage: Storage,
+        ApiKey: ApiKey
       };
     }
 
