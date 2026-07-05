@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- app-version: 2026-07-05.4 -->
+<!-- app-version: 2026-07-05.5 -->
 <!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
      constant (search for `const APP_VERSION =`) MUST stay identical. The
      orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
@@ -62,6 +62,16 @@
       line-height: 1.45;
       -webkit-font-smoothing: antialiased;
       overscroll-behavior-y: none;
+      /* SPE-27 fix 1: kill horizontal pan/rubber-banding on iOS. The layout is
+         phone-shaped (#app max-width 640, centered) and all content is fixed to
+         100%/relative widths, so nothing SHOULD overflow — but a stray wide child
+         (a very long unbroken listing string, or the centered gen toast) could
+         still let the whole page be swiped left-right, shoving the UI off-center.
+         Clamp X here as defense-in-depth AND stop horizontal overscroll so the
+         page can never be panned; per-container overflow-x:auto (filter chips)
+         still works because it's scoped to that element, not the document. */
+      overflow-x: hidden;
+      overscroll-behavior-x: none;
     }
 
     /* App is a single fixed-height column: header / scrolling main / tab bar */
@@ -464,7 +474,9 @@
     }
     .kv-row:last-child { border-bottom: none; }
     .kv-row .k { color: var(--ink-soft); flex: 0 0 auto; }
-    .kv-row .v { text-align: right; font-weight: 600; min-width: 0; word-break: break-word; }
+    /* SPE-27 fix 1: overflow-wrap:anywhere so a long unbroken AI value (e.g. a
+       run-on title with no spaces) breaks instead of forcing page-wide overflow. */
+    .kv-row .v { text-align: right; font-weight: 600; min-width: 0; word-break: break-word; overflow-wrap: anywhere; }
 
     /* Detail action buttons */
     .detail-actions { display: flex; flex-direction: column; gap: 10px; }
@@ -837,7 +849,18 @@
     }
 
     /* Tappable generation-result toast (reuses .copied-toast look). */
-    .gen-toast { cursor: pointer; pointer-events: auto; max-width: 90vw; text-align: center; }
+    /* SPE-27 fix 1: was max-width:90vw. `vw` includes the scrollbar/safe-area gutter
+       and is measured against the FULL layout viewport, so on a phone the centered
+       toast (left:50% + translateX(-50%)) could push its right edge past the visible
+       area and make the page pannable. Cap to the phone-shaped column width with a
+       fixed px max (< 616px #app inner width) and break long unbroken words. */
+    .gen-toast {
+      cursor: pointer; pointer-events: auto; text-align: center;
+      max-width: min(360px, calc(100% - 24px));
+      overflow-wrap: anywhere;
+    }
+    /* Base copy toast: same guard so a long copied string can't overflow either. */
+    .copied-toast { max-width: min(360px, calc(100% - 24px)); overflow-wrap: anywhere; }
 
     /* =========================================================================
        PHASE 6 (SPE-23) — "Update available" banner.
@@ -876,6 +899,58 @@
       color: var(--ink-faint);
       margin: 16px 0 4px;
     }
+
+    /* =========================================================================
+       PHASE 6 (SPE-27) — iOS-style swipe-to-delete on inventory rows.
+       ---------------------------------------------------------------------------
+       Each list row is wrapped in a positioned .inv-swipe-wrap. A single action
+       button (red Delete, or gray View for bundled-sold items) sits BEHIND the row,
+       pinned to the right edge and revealed as the row translates left under the
+       finger. Pointer Events drive the drag (see wireInventoryList): the row gets
+       an inline transform during the gesture, then snaps to the open (-88px) or
+       closed (0) resting state via the .swiping/.open classes below.
+       Only the plain LIST rows swipe — bundle multi-select rows (.selectable) are
+       left alone so selection taps don't fight the gesture.
+       ========================================================================= */
+    .inv-swipe-wrap {
+      position: relative;
+      /* The wrapper carries the row's old bottom gap; the inner .inv-row loses its
+         own margin so the transluscent action sits flush behind it. */
+      margin-bottom: 10px;
+      border-radius: var(--radius);
+      overflow: hidden;              /* clip the row's translate + the action bg */
+    }
+    .inv-swipe-wrap .inv-row {
+      margin-bottom: 0;              /* gap now lives on the wrapper */
+      position: relative;
+      z-index: 1;                    /* sits above the action button */
+      /* pan-y: let vertical scrolling pass through untouched; we only claim the
+         gesture once horizontal intent is detected (JS captures the pointer). */
+      touch-action: pan-y;
+      will-change: transform;
+    }
+    /* While dragging, no transition (follow the finger 1:1); on release we add a
+       snap transition class for the open/close animation. */
+    .inv-swipe-wrap .inv-row.swipe-snap {
+      transition: transform .18s cubic-bezier(.22,.61,.36,1);
+    }
+    /* The revealed action button behind the row. */
+    .inv-swipe-action {
+      position: absolute;
+      top: 0; right: 0; bottom: 0;
+      width: 88px;
+      display: flex; align-items: center; justify-content: center;
+      border: none; margin: 0; padding: 0;
+      font: inherit; font-weight: 700; font-size: 14px;
+      color: #fff;
+      cursor: pointer;
+      /* real tap target: fills the row height, always >= 44px tall in practice. */
+      min-height: 44px;
+      z-index: 0;
+    }
+    .inv-swipe-action.delete { background: var(--danger); }
+    .inv-swipe-action.view   { background: var(--ink-soft); }
+    .inv-swipe-action:active { filter: brightness(.92); }
   </style>
 </head>
 
@@ -1078,7 +1153,7 @@
      copy proved the page was stale). appVersion is also stamped into every AI
      debug snapshot so failure reports say which build produced them.
      =========================================================================== */
-  const APP_VERSION = "2026-07-05.4";
+  const APP_VERSION = "2026-07-05.5";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -1609,6 +1684,21 @@
       if (state.items.length !== n) commit();
     }
 
+    // SPE-27: re-insert a WHOLE item object (used by swipe-to-delete Undo). Unlike
+    // addItem() — which builds a fresh item via makeItem() and mints a new id — this
+    // puts the caller's exact object back verbatim (same id, createdAt, photo,
+    // listing, sale, gen, genJob…), so an undo restores the record byte-for-byte.
+    // Position is not stored explicitly: listItems() sorts by createdAt, so pushing
+    // the original object (with its original createdAt) lands it back in place.
+    // Guards against a duplicate id (double-undo / stale toast) as a no-op.
+    function restoreItem(item) {
+      if (!item || typeof item !== "object" || !item.id) return null;
+      if (state.items.some(i => i.id === item.id)) return getItem(item.id);
+      state.items.push(item);
+      commit();
+      return item;
+    }
+
     function addBundle(partial = {}) {
       const bundle = makeBundle(partial);
       state.bundles.push(bundle);
@@ -1636,7 +1726,7 @@
       // reads
       getItem, getBundle, listItems, listBundles,
       // writes
-      addItem, updateItem, removeItem, addBundle, updateBundle, removeBundle
+      addItem, updateItem, removeItem, restoreItem, addBundle, updateBundle, removeBundle
     };
   })();
 
@@ -4748,17 +4838,27 @@
     } else if (i.gen && i.gen.failed) {
       genBadge = '<span class="badge gen-failed">Failed — retry</span>';
     }
+    // SPE-27: bundled-sold items (sale.bundleId set) reveal a gray "View" instead
+    // of a red Delete — deleting them would break bundle math, so we route to the
+    // detail view where the existing guarded delete-bundle flow lives.
+    var isBundled = !!(i.sale && i.sale.bundleId);
+    var action = isBundled
+      ? '<button class="inv-swipe-action view" type="button" data-swipe-action="view" data-item="' + i.id + '" tabindex="-1">View</button>'
+      : '<button class="inv-swipe-action delete" type="button" data-swipe-action="delete" data-item="' + i.id + '" tabindex="-1">Delete</button>';
     return '' +
-      '<button class="inv-row" data-item="' + i.id + '">' +
-        thumbHTML(i, "inv-thumb") +
-        '<div class="inv-meta">' +
-          '<div class="inv-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
-          '<div class="inv-sub">' + escapeHtml(itemDetailLine(i)) + '</div>' +
-          '<div class="inv-badges"><span class="badge ' + i.status + '">' + statusLabel(i.status) + '</span>' +
-            genBadge + '</div>' +
-        '</div>' +
-        '<span class="inv-chevron">&rsaquo;</span>' +
-      '</button>';
+      '<div class="inv-swipe-wrap" data-swipe-wrap="' + i.id + '">' +
+        action +
+        '<button class="inv-row" data-item="' + i.id + '">' +
+          thumbHTML(i, "inv-thumb") +
+          '<div class="inv-meta">' +
+            '<div class="inv-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
+            '<div class="inv-sub">' + escapeHtml(itemDetailLine(i)) + '</div>' +
+            '<div class="inv-badges"><span class="badge ' + i.status + '">' + statusLabel(i.status) + '</span>' +
+              genBadge + '</div>' +
+          '</div>' +
+          '<span class="inv-chevron">&rsaquo;</span>' +
+        '</button>' +
+      '</div>';
   }
 
   function wireInventoryList() {
@@ -4779,13 +4879,14 @@
       });
     });
     el.querySelectorAll(".inv-row").forEach(function (row) {
-      row.addEventListener("click", function () {
-        // In multi-select mode, rows toggle selection instead of opening detail.
-        if (invState.selectMode) {
-          const iid = row.getAttribute("data-item");
-          if (invState.selected[iid]) delete invState.selected[iid];
-          else invState.selected[iid] = true;
-          renderInventory();
+      row.addEventListener("click", function (ev) {
+        // SPE-27: if a swipe gesture just moved this row, swallow the synthetic
+        // click so opening the drawer never navigates to detail. The flag is set
+        // on pointerup in wireSwipeToDelete and cleared here (one-shot).
+        if (row._swipeSuppressClick) {
+          row._swipeSuppressClick = false;
+          ev.preventDefault();
+          ev.stopPropagation();
           return;
         }
         invState.itemId = row.getAttribute("data-item");
@@ -4796,6 +4897,230 @@
         renderInventory();
       });
     });
+
+    // SPE-27: iOS-style swipe-to-delete on the plain list rows.
+    wireSwipeToDelete(el);
+  }
+
+  /* ===========================================================================
+     SPE-27: swipe-to-delete on inventory list rows.
+     ---------------------------------------------------------------------------
+     Pointer Events (works with touch AND is drivable by synthesized events in the
+     verification harness). Per row:
+       - pointerdown records the start point; nothing is captured yet so a vertical
+         scroll starts scrolling immediately (touch-action: pan-y on the row).
+       - pointermove decides intent ONCE: only if |dx| > |dy| and dx < -10 do we
+         claim the gesture (setPointerCapture) and begin translating the row. A
+         dominant-dy move is ignored, leaving vertical scroll buttery.
+       - the row follows the finger, capped at ~-100px (a little past the 88px
+         action so it has rubber-band headroom).
+       - pointerup snaps OPEN (-88px, revealed) if dragged past ~45px, else CLOSED.
+       - only ONE row is open at a time; opening another (or tapping elsewhere)
+         closes the previous. A gesture that actually moved suppresses the row's
+         tap-to-detail via row._swipeSuppressClick.
+     The whole thing is re-bound cleanly on every render (renderInventory rewrites
+     #inventoryList), so no stale handlers leak; the module-level openSwipeRow ref
+     is cleared when its element is gone.
+     =========================================================================== */
+  const SWIPE_OPEN_PX = 88;       // resting revealed offset (matches action width)
+  const SWIPE_MAX_PX = 100;       // hard cap on how far the finger can drag
+  const SWIPE_THRESHOLD_PX = 45;  // past this on release -> snap open
+  const SWIPE_INTENT_PX = 10;     // horizontal travel before we claim the gesture
+  let openSwipeRow = null;        // the currently-open .inv-row element, or null
+
+  function setRowOffset(row, px, snap) {
+    if (!row) return;
+    row.classList.toggle("swipe-snap", !!snap);
+    row.style.transform = px ? ("translateX(" + px + "px)") : "";
+  }
+  function closeSwipeRow(snap) {
+    if (openSwipeRow) {
+      setRowOffset(openSwipeRow, 0, snap !== false);
+      openSwipeRow._swipeOpen = false;
+      openSwipeRow = null;
+    }
+  }
+  function openRowDrawer(row) {
+    if (openSwipeRow && openSwipeRow !== row) closeSwipeRow(true);
+    setRowOffset(row, -SWIPE_OPEN_PX, true);
+    row._swipeOpen = true;
+    openSwipeRow = row;
+  }
+
+  function wireSwipeToDelete(el) {
+    // A render just replaced the DOM; any previously-open row element is detached.
+    if (openSwipeRow && !document.body.contains(openSwipeRow)) openSwipeRow = null;
+
+    // Action-button taps (Delete / View) behind the rows.
+    el.querySelectorAll(".inv-swipe-action").forEach(function (btn) {
+      btn.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = btn.getAttribute("data-item");
+        const kind = btn.getAttribute("data-swipe-action");
+        closeSwipeRow(false);
+        if (kind === "view") {
+          // Bundled-sold item: route to detail (guarded bundle flow lives there).
+          jumpToItemDetail(id);
+        } else {
+          swipeDeleteItem(id);
+        }
+      });
+    });
+
+    el.querySelectorAll(".inv-row").forEach(function (row) {
+      let startX = 0, startY = 0;
+      let dragging = false;      // gesture claimed (horizontal intent confirmed)
+      let decided = false;       // intent decision made for this pointer
+      let baseOffset = 0;        // offset the row started this gesture at
+      let pointerId = null;
+
+      row.addEventListener("pointerdown", function (e) {
+        // Only primary button / touch / pen; ignore secondary.
+        if (e.button && e.button !== 0) return;
+        startX = e.clientX; startY = e.clientY;
+        dragging = false; decided = false;
+        baseOffset = row._swipeOpen ? -SWIPE_OPEN_PX : 0;
+        pointerId = e.pointerId;
+        row.classList.remove("swipe-snap");   // follow finger 1:1
+      });
+
+      row.addEventListener("pointermove", function (e) {
+        if (pointerId === null || e.pointerId !== pointerId) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        if (!decided) {
+          // Wait for a clear signal before committing either way.
+          if (Math.abs(dx) < SWIPE_INTENT_PX && Math.abs(dy) < SWIPE_INTENT_PX) return;
+          decided = true;
+          // Horizontal-left intent (and not dominated by vertical) -> claim it.
+          if (dx < -SWIPE_INTENT_PX && Math.abs(dx) > Math.abs(dy)) {
+            dragging = true;
+            try { row.setPointerCapture(pointerId); } catch (_) {}
+          } else if (baseOffset !== 0 && dx > SWIPE_INTENT_PX && Math.abs(dx) > Math.abs(dy)) {
+            // Swiping an already-open row back to the right -> also our gesture.
+            dragging = true;
+            try { row.setPointerCapture(pointerId); } catch (_) {}
+          } else {
+            // Vertical / rightward-on-closed -> let the page scroll; bail out.
+            return;
+          }
+        }
+        if (!dragging) return;
+        e.preventDefault();
+        let next = baseOffset + dx;
+        if (next > 0) next = 0;
+        if (next < -SWIPE_MAX_PX) next = -SWIPE_MAX_PX;
+        setRowOffset(row, next, false);
+      });
+
+      function endGesture(e) {
+        if (pointerId === null || (e && e.pointerId !== pointerId)) return;
+        const wasDragging = dragging;
+        try { if (e) row.releasePointerCapture(e.pointerId); } catch (_) {}
+        pointerId = null;
+        if (!wasDragging) { dragging = false; decided = false; return; }
+        dragging = false; decided = false;
+        // Any real drag suppresses the click that a pointerup on a <button> fires.
+        row._swipeSuppressClick = true;
+        const dx = (e ? e.clientX : startX) - startX;
+        const curOffset = baseOffset + dx;
+        if (curOffset <= -SWIPE_THRESHOLD_PX) openRowDrawer(row);
+        else closeSwipeRow(true);
+      }
+      row.addEventListener("pointerup", endGesture);
+      row.addEventListener("pointercancel", function (e) {
+        // Treat a cancel like a release: snap to the nearest resting state.
+        if (pointerId === null || (e && e.pointerId !== pointerId)) return;
+        try { if (e) row.releasePointerCapture(e.pointerId); } catch (_) {}
+        const wasDragging = dragging;
+        pointerId = null; dragging = false; decided = false;
+        if (wasDragging) { row._swipeSuppressClick = true; }
+        if (row._swipeOpen) openRowDrawer(row); else closeSwipeRow(true);
+      });
+    });
+  }
+
+  // SPE-27: delete an item via swipe, with a 5s Undo toast. Deep-copies the item
+  // BEFORE removal so Undo can restore it byte-for-byte (photo/listing/gen/sale),
+  // then removes it through the SAME store path as detail-view delete
+  // (AppStore.removeItem). If the deleted item is currently open in detail, the
+  // store notify() + renderInventory falls back to the list automatically.
+  let swipeUndoTimer = null;
+  function swipeDeleteItem(id) {
+    const item = AppStore.getItem(id);
+    if (!item) return;
+    // Deep copy (structuredClone if available, else JSON) — captures every field
+    // incl. the transient genJob so a cloud-pending undo can resume polling.
+    let snapshot;
+    try { snapshot = (typeof structuredClone === "function") ? structuredClone(item) : JSON.parse(JSON.stringify(item)); }
+    catch (_) { snapshot = JSON.parse(JSON.stringify(item)); }
+    const title = itemDisplayTitle(item);
+    // If this item is open in detail, drop back to the list on delete.
+    if (invState.mode === "detail" && invState.itemId === id) {
+      invState.mode = "list";
+      invState.itemId = null;
+      resetDetailFlags();
+    }
+    AppStore.removeItem(id);   // same semantics as detail delete; notify -> re-render
+    showUndoToast("Deleted “" + title + "”", snapshot);
+  }
+
+  // SPE-27: restore a swipe-deleted item. Re-inserts the exact object (original
+  // createdAt -> correct sort position via listItems). For an interrupted research
+  // item we do the SAFE thing per its class:
+  //   - CLOUD pending (gen:"pending" + genJob): restore as-is and kick CloudPoll so
+  //     it resumes polling the still-live server job.
+  //   - LOCAL pending (gen:"pending", no genJob): the in-memory job is long gone, so
+  //     restore it as an interrupted/failed state (tap-to-retry) rather than a
+  //     spinner that never resolves — mirrors migrate()'s orphan handling.
+  function restoreSwipedItem(snapshot) {
+    if (!snapshot) return;
+    const snap = Object.assign({}, snapshot);
+    if (snap.gen === "pending" && !snap.genJob) {
+      // Local pending with no live job -> interrupted marker (retry affordance).
+      snap.gen = { failed: GEN_INTERRUPTED_MSG };
+    }
+    const restored = AppStore.restoreItem(snap);   // notify -> re-render
+    if (restored && restored.gen === "pending" && restored.genJob) {
+      // Cloud job still alive server-side: resume polling for it.
+      try { CloudPoll.kick(); } catch (_) {}
+    }
+  }
+
+  // SPE-27: the Undo toast. Reuses the .gen-toast pill look but pairs the message
+  // with an inline "Undo" affordance; auto-dismisses after ~5s (item stays deleted).
+  function showUndoToast(msg, snapshot) {
+    let el = document.getElementById("undoToast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "undoToast";
+      el.className = "copied-toast gen-toast";
+      el.setAttribute("role", "status");
+      document.body.appendChild(el);
+    }
+    // Rebuild content: message + Undo button (clone to drop old listeners).
+    const fresh = el.cloneNode(false);
+    el.parentNode.replaceChild(fresh, el);
+    el = fresh;
+    el.textContent = msg + " — ";
+    const undo = document.createElement("span");
+    undo.textContent = "Undo";
+    undo.style.textDecoration = "underline";
+    undo.style.fontWeight = "800";
+    undo.style.marginLeft = "2px";
+    el.appendChild(undo);
+    const dismiss = function () { el.classList.remove("show"); };
+    undo.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (swipeUndoTimer) { clearTimeout(swipeUndoTimer); swipeUndoTimer = null; }
+      dismiss();
+      restoreSwipedItem(snapshot);
+    });
+    void el.offsetWidth;
+    el.classList.add("show");
+    if (swipeUndoTimer) clearTimeout(swipeUndoTimer);
+    swipeUndoTimer = setTimeout(dismiss, 5000);
   }
 
   // Reset all per-detail transient flags (SPE-12/13) when entering/leaving detail.
@@ -5930,7 +6255,12 @@
         normalizeDraft: normalizeDraft,
         AI_DEBUG_STORAGE: AI_DEBUG_STORAGE,
         Storage: Storage,
-        ApiKey: ApiKey
+        ApiKey: ApiKey,
+        // SPE-27: swipe-to-delete seams for the verification harness.
+        swipeDeleteItem: swipeDeleteItem,
+        restoreSwipedItem: restoreSwipedItem,
+        showUndoToast: showUndoToast,
+        getOpenSwipeRow: function () { return openSwipeRow; }
       };
     }
 
