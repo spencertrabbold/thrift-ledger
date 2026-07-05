@@ -771,6 +771,64 @@
       font-size: 13px;
       color: var(--ink-soft);
     }
+
+    /* =========================================================================
+       PHASE 6 (SPE-21) — background price research
+       ---------------------------------------------------------------------------
+       Non-blocking Generate: research runs in the background while Alissa keeps
+       adding items. This section styles the in-flight indicators — inventory
+       badges, the item-detail research panel, and the "N researching" pill.
+       ========================================================================= */
+
+    /* ---- Inventory list badges (reuse .badge sizing) ---- */
+    /* "Researching…" — animated pulse, no gif. */
+    .badge.gen-pending {
+      background: #e6efff; color: var(--accent);
+      animation: genPulse 1.4s ease-in-out infinite;
+    }
+    @keyframes genPulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+    /* "Failed — retry" — warning colour, matches .badge.not-listing family. */
+    .badge.gen-failed { background: #f9ded6; color: var(--danger); }
+
+    /* ---- Item-detail research-in-progress panel ---- */
+    .research-panel { text-align: center; padding: 26px 16px; }
+    .research-orbit {
+      width: 42px; height: 42px; margin: 0 auto 14px;
+      border-radius: 50%;
+      border: 3px solid var(--surface-2);
+      position: relative;
+      animation: spin 1.1s linear infinite;
+    }
+    .research-dot {
+      position: absolute; top: -3px; left: 50%;
+      width: 9px; height: 9px; margin-left: -4.5px;
+      border-radius: 50%; background: var(--accent);
+    }
+
+    /* ---- "N researching" pill: thin bar above the tab bar, tappable ---- */
+    #genPill {
+      position: fixed;
+      left: 12px; right: 12px;
+      bottom: calc(var(--tab-h) + var(--safe-bot) + 10px);
+      max-width: 616px; margin: 0 auto;
+      display: none;                 /* shown only when work is in flight */
+      align-items: center; justify-content: center; gap: 8px;
+      background: var(--ink); color: #fff;
+      font-size: 13px; font-weight: 650;
+      padding: 8px 14px; border-radius: 999px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.22);
+      z-index: 55; cursor: pointer;
+      border: none; font-family: var(--font);
+    }
+    #genPill.show { display: flex; }
+    #genPill .gp-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #7fb0ff;
+      animation: genPulse 1.4s ease-in-out infinite;
+    }
+
+    /* Tappable generation-result toast (reuses .copied-toast look). */
+    .gen-toast { cursor: pointer; pointer-events: auto; max-width: 90vw; text-align: center; }
   </style>
 </head>
 
@@ -808,6 +866,12 @@
       <button data-tab="dashboard"><span class="ico">&#128202;</span>Dashboard</button>
     </nav>
   </div>
+
+  <!-- SPE-21: persistent "N researching" pill. Fixed above the tab bar; shown
+       only while background generation is in flight; tapping opens Inventory. -->
+  <button id="genPill" type="button" aria-label="Items researching — open Inventory">
+    <span class="gp-dot"></span><span id="genPillText"></span>
+  </button>
 
   <script>
   "use strict";
@@ -878,7 +942,21 @@
                                     //   the Bundle, never split per item (see invariants).
          date:     number,          // epoch ms of sale
          bundleId: string|null      // null = single sale; else FK -> Bundle.id
-       }
+       },
+
+       gen:       null | "pending" | { failed: string }
+                            //   Background listing-generation lifecycle (SPE-21).
+                            //   Optional/additive — absent === null === no generation.
+                            //     null / absent    - no background generation for this item
+                            //     "pending"        - research queued or in flight (GenQueue).
+                            //                        The persisted field is the DURABLE truth;
+                            //                        in-memory promise tracking is best-effort.
+                            //     { failed: msg }  - last generation failed; `msg` is a
+                            //                        friendly, user-facing reason (retry from
+                            //                        item detail re-enqueues -> back to "pending").
+                            //   migrate() normalizes any loaded "pending" (app died mid-research)
+                            //   to { failed: "Interrupted — tap to retry" }. No SCHEMA_VERSION
+                            //   bump: this is an optional additive field.
      }
 
      Bundle = {                     // one multi-item sale (SPE-13)
@@ -1170,7 +1248,8 @@
         costPaid: 0,
         status: STATUS.DRAFT,
         listing: null,
-        sale: null
+        sale: null,
+        gen: null           // SPE-21: background-generation lifecycle (see [DATA MODEL]).
       }, overrides);
     }
 
@@ -1202,6 +1281,16 @@
       // v0/undefined -> v1: ensure required arrays + version exist.
       if (!Array.isArray(blob.items)) blob.items = [];
       if (!Array.isArray(blob.bundles)) blob.bundles = [];
+      // SPE-21: any item persisted mid-research (gen === "pending") means the app
+      // died while generating — there is no in-memory promise to resume, so the
+      // durable "pending" is stale. Normalize it to a failed/interrupted state so
+      // the item shows a Retry affordance instead of a spinner that never resolves.
+      // (Also applies to imported backups — an imported "pending" becomes failed.)
+      blob.items.forEach(function (it) {
+        if (it && it.gen === "pending") {
+          it.gen = { failed: "Interrupted — tap to retry" };
+        }
+      });
       // (future) if (blob.schemaVersion < 2) { ...transform... }
       blob.schemaVersion = SCHEMA_VERSION;
       return blob;
@@ -1851,6 +1940,149 @@
   }
 
   /* ===========================================================================
+     [GEN QUEUE]  — SPE-21. Background listing generation.
+     ---------------------------------------------------------------------------
+     Tapping "Generate listing" no longer blocks the Add flow. Instead the item is
+     saved as a 'draft' with gen="pending" and enqueued here; research runs in the
+     background while Alissa keeps adding items. Review happens later in Inventory
+     item detail.
+
+     DESIGN:
+       - The PERSISTED item.gen field is the durable source of truth
+         (null | "pending" | { failed:msg }). This in-memory module only tracks
+         which ids are actively running (`active`) and which are waiting (`queue`)
+         so we can cap concurrency and process FIFO. If the app dies, migrate()
+         turns any orphaned "pending" into a failed/interrupted state on reboot.
+       - Concurrency cap 2. Extra requests wait FIFO.
+       - On completion: updateItem writes the listing, clears gen, keeps status
+         'draft' (she reviews before it counts as listed), and fires a tappable
+         "listing ready" toast -> jumps to that item's detail.
+       - On failure: gen = { failed: msg } (SPE-20 error mapping) + debug capture,
+         and a tappable "failed — tap to retry" toast.
+       - If the item was deleted while pending, the resolved result is discarded
+         (we re-check AppStore.getItem before writing).
+       - Mock mode runs through the SAME lifecycle (it just resolves fast).
+
+     PUBLIC API:
+       GenQueue.enqueue(itemId)   -> mark pending + schedule generation
+       GenQueue.pendingCount()    -> number of items pending (queued + in flight),
+                                     read from the store so it survives re-renders.
+     =========================================================================== */
+  const GenQueue = (function () {
+    const MAX_CONCURRENT = 2;
+    const active = new Set();   // item ids currently generating (in flight)
+    const queue = [];           // item ids waiting for a slot (FIFO)
+
+    // Count of items the store considers pending. Durable truth, not the in-memory
+    // sets — so a re-render or reboot-normalized state stays accurate.
+    function pendingCount() {
+      return AppStore.listItems().filter(function (i) { return i.gen === "pending"; }).length;
+    }
+
+    // A short label for toasts: listing title if present, else brand/category.
+    function labelFor(item) {
+      if (!item) return "item";
+      if (item.listing && item.listing.title && item.listing.title.trim()) {
+        return item.listing.title.trim();
+      }
+      const t = [item.brand, item.category].filter(Boolean).join(" ");
+      return t || "item";
+    }
+
+    // Snapshot the generation payload from the item's structured fields (mirrors
+    // readIntake()'s payload shape — that's what AIListing.generate expects).
+    function payloadFor(item) {
+      return {
+        photo: item.photo || null,
+        category: item.category || "",
+        brand: item.brand || "",
+        size: item.size || "",
+        condition: item.condition || "",
+        costPaid: Number(item.costPaid) || 0
+      };
+    }
+
+    // Enqueue (or re-enqueue, for a retry) generation for an item id. Sets gen
+    // "pending" durably, then tries to start it (respecting the concurrency cap).
+    function enqueue(itemId) {
+      const item = AppStore.getItem(itemId);
+      if (!item) return;
+      AppStore.updateItem(itemId, { gen: "pending" }); // durable pending -> notify re-renders badges
+      if (active.has(itemId) || queue.indexOf(itemId) !== -1) return; // already scheduled
+      queue.push(itemId);
+      pump();
+    }
+
+    // Start as many queued jobs as the concurrency cap allows.
+    function pump() {
+      while (active.size < MAX_CONCURRENT && queue.length > 0) {
+        const id = queue.shift();
+        // Skip ids that no longer exist or are no longer pending (e.g. deleted,
+        // or superseded). The store is the truth.
+        const item = AppStore.getItem(id);
+        if (!item || item.gen !== "pending") continue;
+        run(id);
+      }
+    }
+
+    // Run one generation. Never throws to the caller; resolves the item's gen
+    // field one way or the other and always frees the slot + pumps the queue.
+    function run(itemId) {
+      active.add(itemId);
+      const item = AppStore.getItem(itemId);
+      const payload = payloadFor(item);
+
+      AIListing.generate(payload).then(function (draft) {
+        finishSuccess(itemId, draft);
+      }).catch(function (err) {
+        finishFailure(itemId, err);
+      }).then(function () {
+        active.delete(itemId);
+        pump();
+      });
+    }
+
+    function finishSuccess(itemId, draft) {
+      // Discard if the item was deleted while research ran.
+      const item = AppStore.getItem(itemId);
+      if (!item) return;
+      const normalized = normalizeDraft(draft);
+      // SPE-20 safety net: an empty draft (no title AND no platform text) means
+      // generation produced nothing usable — treat it as a failure, not a blank.
+      if (!isDraftUsable(normalized)) {
+        AIListing.captureRawDebug(draft, "empty_draft");
+        markFailed(itemId, "The AI returned an empty draft — tap to retry");
+        return;
+      }
+      // Write listing, clear gen. Status stays 'draft' — she reviews before it
+      // counts as listed (Mark as Listed lives in item detail now).
+      AppStore.updateItem(itemId, { listing: normalized, gen: null });
+      const label = labelFor(AppStore.getItem(itemId));
+      showGenToast("“" + label + "” listing ready — tap to review", itemId);
+    }
+
+    function finishFailure(itemId, err) {
+      console.warn("[GenQueue] generation failed:", err);
+      // Discard if the item was deleted while research ran.
+      if (!AppStore.getItem(itemId)) return;
+      const msg = (err && err.message) ? err.message : "The AI didn't return a usable listing.";
+      markFailed(itemId, msg);
+    }
+
+    // Set gen.failed + fire the retry toast. (SPE-20 debug capture already
+    // happened inside generateApi for API parse failures; empty-draft capture
+    // happens in finishSuccess.)
+    function markFailed(itemId, msg) {
+      if (!AppStore.getItem(itemId)) return;
+      AppStore.updateItem(itemId, { gen: { failed: msg } });
+      const label = labelFor(AppStore.getItem(itemId));
+      showGenToast("Listing failed for “" + label + "” — tap to retry", itemId);
+    }
+
+    return { enqueue: enqueue, pendingCount: pendingCount };
+  })();
+
+  /* ===========================================================================
      [SETTINGS]  — SPE-19. Modal overlay: API key management, connection test,
      AI mode indicator, and data backup / restore.
      ---------------------------------------------------------------------------
@@ -2278,19 +2510,23 @@
   }
 
   /* ===========================================================================
-     [ADD FLOW]  — SPE-6 (intake) / SPE-7 (AI listing) / SPE-8 (edit) / SPE-9 (links)
+     [ADD FLOW]  — SPE-6 (intake) / SPE-7 (AI listing) / SPE-9 (links)
      ---------------------------------------------------------------------------
      The Add Item tab is a small step machine rendered into #addFlow by
      renderAdd(). Steps:
        'intake'  - photo + fields form (SPE-6)
-       'loading' - generating listing via Claude / mock (SPE-7)
-       'error'   - generation failed; retry or fill manually (SPE-7)
-       'review'  - editable listing + per-platform copy/go buttons (SPE-8/9)
-       'done'    - saved confirmation
+       'done'    - saved confirmation (only via "Save without listing")
+
+     SPE-21: "Generate listing" is now NON-BLOCKING. It saves the draft item,
+     enqueues background research (GenQueue), toasts, and resets straight back to
+     a fresh intake form — it no longer walks through 'loading'/'review'/'error'
+     here. Those steps are gone from the Add flow; review + the failure/retry
+     escape hatches (retry, fill-in-manually, copy-debug — all from SPE-20) now
+     live in Inventory item detail (see inventoryDetailHTML / GenQueue).
 
      All transient step state lives in `addState` (NOT in AppStore — it's UI
      scratch, not persisted). The item itself is created in AppStore as a
-     'draft' the moment intake is saved, then patched to 'listed' on save.
+     'draft' the moment intake is saved.
      =========================================================================== */
   const addState = {
     step: "intake",
@@ -2298,10 +2534,7 @@
     form: null,          // { photo, category, categoryOther, brand, size, condition, costPaid }
     error: "",           // validation error text
     // the draft Item id once created in the store
-    itemId: null,
-    // AI/mock draft being reviewed+edited (a listing-shaped object)
-    draft: null,
-    genError: ""         // generation error text
+    itemId: null
   };
 
   function freshForm() {
@@ -2314,9 +2547,6 @@
     if (!addState.form) addState.form = freshForm();
 
     switch (addState.step) {
-      case "loading": host.innerHTML = addFlowLoadingHTML(); break;
-      case "error":   host.innerHTML = addFlowGenErrorHTML(); break;
-      case "review":  host.innerHTML = addFlowReviewHTML(); break;
       case "done":    host.innerHTML = addFlowDoneHTML(); break;
       case "intake":
       default:        host.innerHTML = addFlowIntakeHTML(); break;
@@ -2398,102 +2628,18 @@
       '</form>';
   }
 
-  /* ---------------------- STEP: loading (SPE-7) ---------------------- */
-  function addFlowLoadingHTML() {
-    const m = AIListing.mode();
-    const heading = m === "api" ? "Researching prices&hellip;" : "Drafting the listing&hellip;";
-    const sub = m === "api"    ? "Searching Poshmark, eBay, Mercari &amp; Depop for comparables. This can take up to a minute."
-              : m === "builtin" ? "Researching comparable resale prices."
-              : "Using local mock generator (Demo mode).";
-    return '' +
-      '<div class="card">' + itemStripHTML() + '</div>' +
-      '<div class="card"><div class="loading-block">' +
-        '<div class="spinner"></div>' +
-        '<div style="font-weight:650;">' + heading + '</div>' +
-        '<div class="muted" style="margin-top:6px;">' + sub + '</div>' +
-      '</div></div>';
-  }
-
-  /* ---------------------- STEP: generation error (SPE-7) ---------------------- */
-  function addFlowGenErrorHTML() {
-    return '' +
-      '<div class="card">' + itemStripHTML() + '</div>' +
-      '<div class="card">' +
-        '<h2>Couldn’t generate a listing</h2>' +
-        '<p class="muted">' + escapeHtml(addState.genError || "Something went wrong.") + '</p>' +
-        '<button class="btn" id="retryGenBtn" type="button">Retry</button>' +
-        '<button class="btn secondary" id="manualFillBtn" type="button" style="margin-top:10px;">Fill in manually</button>' +
-        // SPE-20: lets the user copy a redacted debug snapshot to send to the dev.
-        '<button class="btn ghost debug-copy-btn" id="copyDebugBtn" type="button">Copy debug info</button>' +
-      '</div>';
-  }
-
-  /* ---------------------- STEP: review + edit (SPE-8/9) ---------------------- */
-  function addFlowReviewHTML() {
-    const d = addState.draft || AppStore.makeListing();
-    const platformBlocks = PLATFORMS.map(function (p) {
-      return '' +
-        '<div class="platform-block" data-platform="' + p + '">' +
-          '<div class="phead">' +
-            '<span class="pname"><span class="pdot ' + p + '"></span>' + escapeHtml(PLATFORM_LABELS[p]) + '</span>' +
-            '<div class="pactions">' +
-              '<button class="btn secondary" type="button" data-copy="' + p + '">Copy</button>' +
-              '<button class="btn ghost" type="button" data-go="' + p + '">Go to ' + escapeHtml(PLATFORM_LABELS[p]) + '</button>' +
-            '</div>' +
-          '</div>' +
-          '<textarea data-field="platform" data-platform-field="' + p + '">' + escapeHtml(d.platforms[p] || "") + '</textarea>' +
-        '</div>';
-    }).join("");
-
-    return '' +
-      '<div class="card">' + itemStripHTML() + '</div>' +
-      '<div class="card">' +
-        '<div class="section-label">Listing draft &middot; everything editable</div>' +
-        '<div class="field"><label>Title</label>' +
-          '<input data-field="title" value="' + escapeHtml(d.title || "") + '" /></div>' +
-        '<div class="field"><label>Description</label>' +
-          '<textarea data-field="description" style="min-height:110px;">' + escapeHtml(d.description || "") + '</textarea></div>' +
-        '<div class="field"><label>Suggested price (USD)</label>' +
-          '<div class="price-input-wrap"><span class="dollar">$</span>' +
-          '<input data-field="suggestedPrice" type="number" inputmode="decimal" step="0.01" min="0" ' +
-            'value="' + escapeHtml(numOrEmpty(d.suggestedPrice)) + '" /></div></div>' +
-      '</div>' +
-      '<div class="card">' +
-        '<div class="section-label">Per-platform text</div>' +
-        platformBlocks +
-      '</div>' +
-      '<button class="btn" id="saveListingBtn" type="button">Save listing</button>' +
-      '<button class="btn secondary" id="regenBtn" type="button" style="margin-top:10px;">Regenerate</button>' +
-      '<button class="btn ghost" id="discardListingBtn" type="button" style="margin-top:10px;">Discard &amp; start over</button>';
-  }
-
-  /* ---------------------- STEP: done ---------------------- */
+  /* ---------------------- STEP: done (Save without listing) ---------------------- */
   function addFlowDoneHTML() {
     return '' +
       '<div class="card">' +
         '<div class="placeholder" style="padding:30px 16px;">' +
           '<span class="emoji">&#9989;</span>' +
-          '<div style="font-weight:650;color:var(--ink);">Item saved &amp; listed</div>' +
-          '<div class="muted" style="margin-top:6px;">It’s in your inventory now.</div>' +
+          '<div style="font-weight:650;color:var(--ink);">Item saved</div>' +
+          '<div class="muted" style="margin-top:6px;">Saved as a draft — no listing generated. It’s in your inventory now.</div>' +
         '</div>' +
         '<button class="btn" id="addAnotherBtn" type="button">Add another item</button>' +
         '<button class="btn secondary" id="viewInventoryBtn" type="button" style="margin-top:10px;">View inventory</button>' +
       '</div>';
-  }
-
-  // Small item summary used across generate/review steps.
-  function itemStripHTML() {
-    const f = addState.form || freshForm();
-    const cat = f.category === "__other" ? f.categoryOther : f.category;
-    const title = [f.brand, cat].filter(Boolean).join(" ") || "New item";
-    const bits = [f.size ? "Size " + f.size : "", f.condition ? CONDITION_LABELS[f.condition] || f.condition : "",
-                  "Cost " + money(parseFloat(f.costPaid) || 0)].filter(Boolean).join(" · ");
-    const img = f.photo
-      ? '<img src="' + f.photo + '" alt="" />'
-      : '<img alt="" style="display:flex;align-items:center;justify-content:center;font-size:20px;" />';
-    return '<div class="item-strip">' + img +
-      '<div class="meta"><div class="t">' + escapeHtml(title) + '</div>' +
-      '<div class="s">' + escapeHtml(bits) + '</div></div></div>';
   }
 
   function numOrEmpty(n) {
@@ -2547,70 +2693,6 @@
       if (genBtn) genBtn.addEventListener("click", onGenerateListing);
       const saveNo = document.getElementById("saveNoListingBtn");
       if (saveNo) saveNo.addEventListener("click", onSaveWithoutListing);
-    }
-
-    if (addState.step === "error") {
-      const retry = document.getElementById("retryGenBtn");
-      if (retry) retry.addEventListener("click", onGenerateListing);
-      const manual = document.getElementById("manualFillBtn");
-      if (manual) manual.addEventListener("click", function () {
-        // Provide an empty draft so she can fill it herself (SPE-7 fallback path).
-        addState.draft = AppStore.makeListing({ suggestedPrice: "" });
-        addState.step = "review";
-        renderAdd();
-      });
-      // SPE-20: copy the stored debug snapshot (redacted; never the key) so the
-      // user can paste it back to the developer.
-      const dbg = document.getElementById("copyDebugBtn");
-      if (dbg) dbg.addEventListener("click", async function () {
-        let snapshot = null;
-        try { snapshot = await Storage.get(AI_DEBUG_STORAGE); } catch (_) {}
-        if (!snapshot) {
-          showCopiedToast("No debug info yet.");
-          return;
-        }
-        let json;
-        try { json = JSON.stringify(snapshot, null, 2); }
-        catch (_) { json = String(snapshot); }
-        copyText(json, dbg);
-      });
-    }
-
-    if (addState.step === "review") {
-      // Live-bind every editable field back into addState.draft (SPE-8).
-      host.querySelectorAll("[data-field]").forEach(function (el) {
-        el.addEventListener("input", function () {
-          const field = el.getAttribute("data-field");
-          if (field === "platform") {
-            addState.draft.platforms[el.getAttribute("data-platform-field")] = el.value;
-          } else if (field === "suggestedPrice") {
-            addState.draft.suggestedPrice = el.value; // parsed on save
-          } else {
-            addState.draft[field] = el.value;
-          }
-        });
-      });
-      // Copy buttons (SPE-8)
-      host.querySelectorAll("[data-copy]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          const p = btn.getAttribute("data-copy");
-          copyText(addState.draft.platforms[p] || "", btn);
-        });
-      });
-      // Go-to-platform buttons (SPE-9)
-      host.querySelectorAll("[data-go]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          const p = btn.getAttribute("data-go");
-          const url = PLATFORM_URLS[p];
-          if (url) window.open(url, "_blank", "noopener");
-        });
-      });
-      const saveBtn = document.getElementById("saveListingBtn");
-      if (saveBtn) saveBtn.addEventListener("click", onSaveListing);
-      const regen = document.getElementById("regenBtn");
-      if (regen) regen.addEventListener("click", onGenerateListing);
-      const discard = document.getElementById("discardListingBtn");
-      if (discard) discard.addEventListener("click", onDiscardFlow);
     }
 
     if (addState.step === "done") {
@@ -2711,36 +2793,23 @@
     renderAdd();
   }
 
-  async function onGenerateListing() {
+  // SPE-21: "Generate listing" is now NON-BLOCKING. We save the item as a draft,
+  // enqueue background research for it, briefly confirm, and immediately reset the
+  // Add flow to a fresh intake form so Alissa can photograph the next item while
+  // research runs. Review happens later in Inventory item detail (see GenQueue).
+  function onGenerateListing() {
     const res = readIntake();
     if (!res.ok) { addState.error = res.error; addState.step = "intake"; renderAdd(); return; }
     addState.error = "";
-    withoutAddRerender(function () { ensureDraftItem(res.payload); }); // create/refresh the draft item
-
-    addState.step = "loading";
-    addState.genError = "";
-    renderAdd();
-
-    try {
-      const draft = await AIListing.generate(res.payload);
-      const normalized = normalizeDraft(draft);
-      // SPE-20 safety net: a normalized draft with an empty title AND all four
-      // empty platform texts means generation produced nothing usable (the
-      // extractor latched onto the wrong JSON, or the draft JSON was missing).
-      // Treat it exactly like a generation failure — never show a blank review.
-      if (!isDraftUsable(normalized)) {
-        AIListing.captureRawDebug(draft, "empty_draft");
-        addState.genError = "The AI returned an empty draft — tap Retry";
-        addState.step = "error";
-      } else {
-        addState.draft = normalized;
-        addState.step = "review";
-      }
-    } catch (err) {
-      console.warn("[AIListing] generate failed:", err);
-      addState.genError = (err && err.message) ? err.message : "The AI didn't return a usable listing.";
-      addState.step = "error";
-    }
+    let itemId = null;
+    withoutAddRerender(function () {
+      itemId = ensureDraftItem(res.payload); // create/refresh the draft item
+    });
+    // Kick off background generation (sets gen:"pending" + notifies).
+    if (itemId) GenQueue.enqueue(itemId);
+    // Confirm + reset to a fresh intake form for the next item.
+    showCopiedToast("Researching prices — keep adding items");
+    resetAddFlow();
     renderAdd();
   }
 
@@ -2774,45 +2843,11 @@
     return base;
   }
 
-  function onSaveListing() {
-    const d = addState.draft || AppStore.makeListing();
-    const price = parseFloat(d.suggestedPrice);
-    const listing = AppStore.makeListing({
-      title: (d.title || "").trim(),
-      description: (d.description || "").trim(),
-      suggestedPrice: isNaN(price) ? 0 : price,
-      platforms: {
-        poshmark: d.platforms.poshmark || "",
-        ebay: d.platforms.ebay || "",
-        mercari: d.platforms.mercari || "",
-        depop: d.platforms.depop || ""
-      }
-    });
-    withoutAddRerender(function () {
-      const latest = readIntake();
-      if (latest.ok) ensureDraftItem(latest.payload); // make sure item reflects latest fields
-      AppStore.updateItem(addState.itemId, { listing: listing, status: STATUS.LISTED });
-    });
-    addState.step = "done";
-    renderAdd();
-  }
-
-  function onDiscardFlow() {
-    // Remove the draft item we created so nothing orphaned is left behind.
-    withoutAddRerender(function () {
-      if (addState.itemId) AppStore.removeItem(addState.itemId);
-    });
-    resetAddFlow();
-    renderAdd();
-  }
-
   function resetAddFlow() {
     addState.step = "intake";
     addState.form = freshForm();
     addState.error = "";
     addState.itemId = null;
-    addState.draft = null;
-    addState.genError = "";
   }
 
   /* ---------------------- copy-to-clipboard w/ fallback (SPE-8) ---------------------- */
@@ -2831,6 +2866,35 @@
     el.classList.add("show");
     if (copyToastTimer) clearTimeout(copyToastTimer);
     copyToastTimer = setTimeout(function () { el.classList.remove("show"); }, 1400);
+  }
+
+  // SPE-21: tappable toast for background-generation results. Reuses the
+  // .copied-toast pill look but adds .tappable styling + an onTap handler
+  // (typically jumpToItemDetail). Stays a little longer than the copy toast so
+  // Alissa — who may be mid-typing on the next item — has time to tap it.
+  let genToastTimer = null;
+  function showGenToast(msg, itemId) {
+    let el = document.getElementById("genToast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "genToast";
+      el.className = "copied-toast gen-toast";
+      el.setAttribute("role", "status");
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    // Rebind the tap handler for THIS toast's item (clone to drop old listeners).
+    const fresh = el.cloneNode(true);
+    el.parentNode.replaceChild(fresh, el);
+    el = fresh;
+    el.addEventListener("click", function () {
+      el.classList.remove("show");
+      if (itemId && AppStore.getItem(itemId)) jumpToItemDetail(itemId);
+    });
+    void el.offsetWidth;
+    el.classList.add("show");
+    if (genToastTimer) clearTimeout(genToastTimer);
+    genToastTimer = setTimeout(function () { el.classList.remove("show"); }, 4200);
   }
 
   // Non-blocking storage warning banner (SPE-15). Shows briefly; never blocks.
@@ -3047,13 +3111,23 @@
   }
 
   function inventoryRowHTML(i) {
+    // SPE-21: background-generation badge alongside the status badge.
+    //   gen === "pending"  -> animated "Researching…" pill
+    //   gen.failed         -> warning "Failed — retry" pill
+    var genBadge = "";
+    if (i.gen === "pending") {
+      genBadge = '<span class="badge gen-pending">&#128269; Researching&hellip;</span>';
+    } else if (i.gen && i.gen.failed) {
+      genBadge = '<span class="badge gen-failed">Failed — retry</span>';
+    }
     return '' +
       '<button class="inv-row" data-item="' + i.id + '">' +
         thumbHTML(i, "inv-thumb") +
         '<div class="inv-meta">' +
           '<div class="inv-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
           '<div class="inv-sub">' + escapeHtml(itemDetailLine(i)) + '</div>' +
-          '<div class="inv-badges"><span class="badge ' + i.status + '">' + statusLabel(i.status) + '</span></div>' +
+          '<div class="inv-badges"><span class="badge ' + i.status + '">' + statusLabel(i.status) + '</span>' +
+            genBadge + '</div>' +
         '</div>' +
         '<span class="inv-chevron">&rsaquo;</span>' +
       '</button>';
@@ -3383,10 +3457,36 @@
         '<span class="v' + cls + '">' + escapeHtml(f[1]) + '</span></div>';
     }).join("");
 
-    // Listing block (editable) — only when a listing exists. Reuses the Phase 2
-    // per-platform pattern (pdot / phead / pactions / Copy / Go to Platform).
+    // Listing block. SPE-21 adds two states BEFORE a listing exists:
+    //   gen === "pending"  -> research-in-progress panel (no editable fields yet)
+    //   gen.failed         -> failure panel: message + Retry + Fill-in-manually +
+    //                         Copy debug info (the SPE-20 error-step escape hatches,
+    //                         moved here from the old add-flow error step)
+    // Otherwise: editable listing (if present) or the plain no-listing placeholder.
     let listingBlock = "";
-    if (i.listing) {
+    if (i.gen === "pending") {
+      // Animated research panel — CSS pulse, no gif.
+      listingBlock =
+        '<div class="card">' +
+          '<div class="research-panel">' +
+            '<div class="research-orbit"><span class="research-dot"></span></div>' +
+            '<div style="font-weight:650;color:var(--ink);">&#128269; Researching prices&hellip;</div>' +
+            '<div class="muted" style="margin-top:6px;">Searching Poshmark, eBay, Mercari &amp; Depop for comparables. ' +
+              'You can keep adding items — the listing will land here when it’s ready.</div>' +
+          '</div>' +
+        '</div>';
+    } else if (i.gen && i.gen.failed) {
+      // Failure panel (SPE-20 escape hatches moved to detail).
+      listingBlock =
+        '<div class="card">' +
+          '<h2>Couldn’t generate a listing</h2>' +
+          '<p class="muted">' + escapeHtml(i.gen.failed) + '</p>' +
+          '<button class="btn" type="button" data-act="gen-retry">Retry</button>' +
+          '<button class="btn secondary" type="button" data-act="gen-manual" style="margin-top:10px;">Fill in manually</button>' +
+          // SPE-20: copy a redacted debug snapshot to send to the developer.
+          '<button class="btn ghost debug-copy-btn" type="button" data-act="gen-copy-debug">Copy debug info</button>' +
+        '</div>';
+    } else if (i.listing) {
       const d = i.listing;
       const platformBlocks = PLATFORMS.map(function (p) {
         return '' +
@@ -3511,8 +3611,20 @@
         '</div>';
     } else {
       // ---- Default sellable-item actions ----
+      // SPE-21: a DRAFT whose listing is ready (not pending, not failed) gets a
+      // clear primary "Mark as Listed" — this replaces the old add-flow review's
+      // save action. Mark as Sold then drops to a secondary style.
+      const listingReady = i.status === STATUS.DRAFT && i.listing &&
+                           i.gen !== "pending" && !(i.gen && i.gen.failed);
+      const markListedBtn = listingReady
+        ? '<button class="btn" type="button" data-act="mark-listed">Mark as Listed</button>'
+        : '';
+      const soldBtn = listingReady
+        ? '<button class="btn secondary" type="button" id="markSoldBtn" data-act="mark-sold">Mark as Sold</button>'
+        : '<button class="btn" type="button" id="markSoldBtn" data-act="mark-sold">Mark as Sold</button>';
       statusActions =
-        '<button class="btn" type="button" id="markSoldBtn" data-act="mark-sold">Mark as Sold</button>' +
+        markListedBtn +
+        soldBtn +
         '<button class="btn secondary" type="button" data-act="not-listing">Mark &ldquo;Not Listing&rdquo;</button>';
     }
 
@@ -3640,6 +3752,29 @@
         if (act === "not-listing") {
           AppStore.updateItem(id, { status: STATUS.NOT_LISTING });
           // store notify() re-renders detail in place with the new status/actions.
+        // ---- SPE-21: background-generation actions (detail-context) ----
+        } else if (act === "mark-listed") {
+          // Draft's listing is ready & reviewed -> promote to 'listed'. This
+          // replaces the old add-flow review's "Save listing" action.
+          AppStore.updateItem(id, { status: STATUS.LISTED }); // notify -> re-render
+        } else if (act === "gen-retry") {
+          // Re-enqueue background generation (gen back to "pending").
+          GenQueue.enqueue(id); // notify -> re-render shows the research panel
+        } else if (act === "gen-manual") {
+          // Fill-in-manually: clear the failed state and drop an empty editable
+          // listing in so she can type it herself (SPE-20 fallback, moved here).
+          AppStore.updateItem(id, { gen: null, listing: AppStore.makeListing() });
+        } else if (act === "gen-copy-debug") {
+          // Copy the redacted debug snapshot (never the key) to send to the dev.
+          (async function () {
+            let snapshot = null;
+            try { snapshot = await Storage.get(AI_DEBUG_STORAGE); } catch (_) {}
+            if (!snapshot) { showCopiedToast("No debug info yet."); return; }
+            let json;
+            try { json = JSON.stringify(snapshot, null, 2); }
+            catch (_) { json = String(snapshot); }
+            copyText(json, btn);
+          })();
         } else if (act === "relist") {
           // Reverse: go back to 'listed' if a listing exists, else 'draft'.
           const cur = AppStore.getItem(id);
@@ -3950,6 +4085,23 @@
     if (tab === "add") { if (!suppressAddRerender) renderAdd(); }
     else if (tab === "inventory") { if (!suppressInvRerender) renderInventory(); }
     else if (tab === "dashboard") renderDashboard();
+    renderGenPill(); // SPE-21: keep the "N researching" pill in sync on every change
+  }
+
+  // SPE-21: show/update the persistent "🔎 N researching" pill. Runs on every
+  // store change (via renderActive). It's a fixed element outside the views, so
+  // it survives tab switches; hidden when nothing is in flight.
+  function renderGenPill() {
+    const pill = document.getElementById("genPill");
+    if (!pill) return;
+    const n = GenQueue.pendingCount();
+    if (n > 0) {
+      const txt = document.getElementById("genPillText");
+      if (txt) txt.textContent = n + " researching";
+      pill.classList.add("show");
+    } else {
+      pill.classList.remove("show");
+    }
   }
   // Set true around store mutations inside Add-flow handlers that will call
   // renderAdd() themselves afterward.
@@ -4000,6 +4152,10 @@
     // Settings gear (SPE-19).
     const gear = document.getElementById("settingsBtn");
     if (gear) gear.addEventListener("click", function () { openSettings(); });
+
+    // SPE-21: tapping the "N researching" pill jumps to Inventory.
+    const pill = document.getElementById("genPill");
+    if (pill) pill.addEventListener("click", function () { Router.go("inventory"); });
     // Close the settings modal with Escape.
     document.addEventListener("keydown", function (e) {
       if (e.key === "Escape" && settingsState.open) closeSettings();
