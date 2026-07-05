@@ -1,4 +1,12 @@
 <!DOCTYPE html>
+<!-- app-version: 2026-07-05.1 -->
+<!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
+     constant (search for `const APP_VERSION =`) MUST stay identical. The
+     orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
+     `app-version:` token on the line above, and (2) the APP_VERSION string. Other
+     occurrences of the version in nearby comments are just documentation.
+     UpdateCheck reads this marker from the freshly-fetched page to detect a new
+     build; APP_VERSION is what the running build believes it is. -->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -829,6 +837,44 @@
 
     /* Tappable generation-result toast (reuses .copied-toast look). */
     .gen-toast { cursor: pointer; pointer-events: auto; max-width: 90vw; text-align: center; }
+
+    /* =========================================================================
+       PHASE 6 (SPE-23) — "Update available" banner.
+       ---------------------------------------------------------------------------
+       A persistent, tappable pill in the same fixed slot family as #genPill. When
+       both are visible they STACK: the gen pill sits at the base slot and the
+       update banner floats just above it (see #updateBanner.with-gen-pill). Never
+       auto-reloads — only a tap calls location.reload().
+       ========================================================================= */
+    #updateBanner {
+      position: fixed;
+      left: 12px; right: 12px;
+      bottom: calc(var(--tab-h) + var(--safe-bot) + 10px);
+      max-width: 616px; margin: 0 auto;
+      display: none;                 /* shown only when a newer build is live */
+      align-items: center; justify-content: center; gap: 8px;
+      background: var(--accent); color: var(--accent-ink);
+      font-size: 13px; font-weight: 650;
+      padding: 8px 14px; border-radius: 999px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.22);
+      z-index: 56; cursor: pointer;   /* one above #genPill so it reads as primary */
+      border: none; font-family: var(--font);
+    }
+    #updateBanner.show { display: flex; }
+    /* When the gen pill is also visible, lift the update banner above it. The gen
+       pill is ~34px tall incl. padding; 46px clears it with a small gap. */
+    #updateBanner.with-gen-pill {
+      bottom: calc(var(--tab-h) + var(--safe-bot) + 10px + 46px);
+    }
+    #updateBanner .ub-ico { font-size: 14px; line-height: 1; }
+
+    /* SPE-23: version line at the bottom of the Settings sheet. */
+    .settings-version {
+      text-align: center;
+      font-size: 12px;
+      color: var(--ink-faint);
+      margin: 16px 0 4px;
+    }
   </style>
 </head>
 
@@ -871,6 +917,13 @@
        only while background generation is in flight; tapping opens Inventory. -->
   <button id="genPill" type="button" aria-label="Items researching — open Inventory">
     <span class="gp-dot"></span><span id="genPillText"></span>
+  </button>
+
+  <!-- SPE-23: persistent "Update available" banner. Fixed above the tab bar; shown
+       only when UpdateCheck detects a newer deployed build; tapping reloads. Stacks
+       above #genPill when both are visible. -->
+  <button id="updateBanner" type="button" aria-label="A new version is available — tap to refresh">
+    <span class="ub-ico">&#8635;</span><span>Update available — tap to refresh</span>
   </button>
 
   <script>
@@ -990,6 +1043,26 @@
 
   const SCHEMA_VERSION = 1;
   const ROOT_KEY = "thrift-ledger:v1";
+
+  // SPE-21 / SPE-23: the exact friendly message migrate() writes when it normalizes
+  // an orphaned gen==="pending" (app died mid-research) to a failed state. SPE-23's
+  // boot-time auto-resume (resumeInterruptedOnBoot) matches THIS exact marker to
+  // decide which items to auto-requeue once, so the two must stay in sync — hence a
+  // single shared constant.
+  const GEN_INTERRUPTED_MSG = "Interrupted — tap to retry";
+
+  /* ===========================================================================
+     [APP VERSION]  — SPE-23. Single source of truth for the deployed build id.
+     ---------------------------------------------------------------------------
+     THIS CONSTANT AND THE HTML MARKER COMMENT NEAR THE TOP OF THE FILE
+     (`<!-- app-version: 2026-07-05.1 -->`) MUST STAY IDENTICAL. The orchestrator
+     bumps BOTH on every deploy. UpdateCheck fetches the live page, reads the
+     marker, and compares it to this constant to detect a stale cached build (the
+     root cause of SPE-23: iOS served an old cached build whose pre-SPE-22 error
+     copy proved the page was stale). appVersion is also stamped into every AI
+     debug snapshot so failure reports say which build produced them.
+     =========================================================================== */
+  const APP_VERSION = "2026-07-05.1";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -1298,9 +1371,17 @@
       // durable "pending" is stale. Normalize it to a failed/interrupted state so
       // the item shows a Retry affordance instead of a spinner that never resolves.
       // (Also applies to imported backups — an imported "pending" becomes failed.)
+      // SPE-23: migrate() normalizes to the interrupted marker on EVERY load path
+      // (boot AND import). This keeps the import path correct — an imported "pending"
+      // has no live job and becomes a retry affordance. On the LIVE BOOT path,
+      // resumeInterruptedOnBoot() (run right after load) finds items carrying this
+      // exact marker and auto-requeues them ONCE when an AI mode is available, so the
+      // user doesn't have to manually retry a job the app itself interrupted. Design
+      // choice: keep one normalization here + a boot-only resume pass, rather than
+      // threading a boot/import discriminator through migrate() (see BOOT section).
       blob.items.forEach(function (it) {
         if (it && it.gen === "pending") {
-          it.gen = { failed: "Interrupted — tap to retry" };
+          it.gen = { failed: GEN_INTERRUPTED_MSG };
         }
       });
       // (future) if (blob.schemaVersion < 2) { ...transform... }
@@ -1814,6 +1895,7 @@
           .slice(0, 20000);
         const snapshot = {
           when: new Date().toISOString(),
+          appVersion: APP_VERSION,          // SPE-23: which build produced this failure
           kind: "parse",
           stop_reason: (response && response.stop_reason) || null,
           contentBlockTypes: blockTypes,
@@ -1831,7 +1913,7 @@
     function captureFailureDebug(fields, meta) {
       try {
         const snapshot = Object.assign(
-          { when: new Date().toISOString() },
+          { when: new Date().toISOString(), appVersion: APP_VERSION },  // SPE-23
           fields || {},
           { request: meta || null }
         );
@@ -2094,6 +2176,7 @@
         try {
           Storage.set(AI_DEBUG_STORAGE, {
             when: new Date().toISOString(),
+            appVersion: APP_VERSION,          // SPE-23: which build produced this failure
             kind: "empty_draft",
             stop_reason: stopReason || null,
             contentBlockTypes: [],
@@ -2122,6 +2205,154 @@
       default:        return "Demo mode";
     }
   }
+
+  /* ===========================================================================
+     [UPDATE CHECK]  — SPE-23 feature 1. Kills silent-stale-build failures.
+     ---------------------------------------------------------------------------
+     ROOT CAUSE (from the ticket's on-device evidence): iOS home-screen web apps
+     aggressively cache the HTML. A retest surfaced the OLD pre-SPE-22 "AI request
+     timed out" copy — proof the phone was running a stale cached build that never
+     got the timeout/retry fixes. This module detects that: it fetches the live
+     page bytes (cache-busted), reads the `app-version` marker comment, and if it
+     differs from the running APP_VERSION shows a persistent tap-to-refresh banner.
+
+     DESIGN:
+       - Runs on boot and on every visibilitychange→visible, THROTTLED to at most
+         once per CHECK_THROTTLE_MS (5 min) so rapid foreground/background flips
+         don't hammer the network.
+       - fetch(location.href, {cache:"reload"}) + a `?v=<ts>` cache-buster query so
+         neither the HTTP cache nor a Service Worker can serve stale bytes.
+       - NEVER auto-reloads (an in-progress intake/sale form must not be destroyed).
+         Only a user tap on the banner calls location.reload().
+       - Silent on any network error (offline is normal on a phone).
+       - The banner shares the fixed slot family with #genPill; renderGenPill()
+         handles stacking so they never overlap.
+     =========================================================================== */
+  const UpdateCheck = (function () {
+    let throttleMs = 5 * 60 * 1000;            // at most one check per 5 minutes
+    let lastCheck = 0;
+    let updateReady = false;                   // latched true once a newer build seen
+    // Test seam: the harness stubs fetch + shrinks the throttle without shipping it.
+    let fetchImpl = (typeof fetch !== "undefined") ? fetch.bind(window) : null;
+
+    // Pull the app-version marker out of fetched page text. Same token the HTML
+    // marker uses: `app-version: 2026-07-05.1`.
+    function parseVersion(text) {
+      if (typeof text !== "string") return null;
+      const m = text.match(/app-version:\s*([\w.\-]+)/);
+      return m ? m[1] : null;
+    }
+
+    // Show the persistent banner (idempotent). Never auto-reloads.
+    function showBanner() {
+      updateReady = true;
+      const el = document.getElementById("updateBanner");
+      if (el) el.classList.add("show");
+      // Re-run pill layout so the banner stacks above #genPill if both show.
+      if (typeof renderGenPill === "function") renderGenPill();
+    }
+    function isReady() { return updateReady; }
+
+    // Perform one check now (respecting the throttle unless force=true).
+    async function check(force) {
+      if (updateReady) return;                 // already flagged — nothing more to do
+      const now = Date.now();
+      if (!force && (now - lastCheck) < throttleMs) return;
+      lastCheck = now;
+      if (!fetchImpl) return;
+      try {
+        const url = location.href.split("#")[0];
+        const sep = url.indexOf("?") === -1 ? "?" : "&";
+        const bust = url + sep + "v=" + Date.now();
+        const res = await fetchImpl(bust, { cache: "reload" });
+        if (!res || !res.ok) return;           // silent on any non-200
+        const text = await res.text();
+        const remote = parseVersion(text);
+        // Only flag when we positively read a DIFFERENT version. A missing marker
+        // (parse failed) is treated as "can't tell" → stay silent.
+        if (remote && remote !== APP_VERSION) showBanner();
+      } catch (_) {
+        /* offline / CORS / abort — silent by design */
+      }
+    }
+
+    // Wire the banner tap (reload) + boot/visibility checks.
+    function init() {
+      const el = document.getElementById("updateBanner");
+      if (el) el.addEventListener("click", function () { location.reload(); });
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible") check(false);
+      });
+      check(true);                             // boot check (bypasses throttle once)
+    }
+
+    // Test seams: override fetch + throttle without shipping shortened values.
+    function __setFetch(fn) { fetchImpl = fn; }
+    function __setThrottle(ms) { if (typeof ms === "number") throttleMs = ms; }
+
+    return {
+      init: init, check: check, isReady: isReady, parseVersion: parseVersion,
+      __setFetch: __setFetch, __setThrottle: __setThrottle
+    };
+  })();
+
+  /* ===========================================================================
+     [WAKE LOCK]  — SPE-23 feature 2. Keep the screen awake while researching.
+     ---------------------------------------------------------------------------
+     ROOT CAUSE (ticket evidence): "Interrupted" failures came from the page being
+     suspended mid-research — most likely iOS auto-locking the screen during the
+     1–3 minute wait, which pauses timers and kills the in-flight fetch. Holding a
+     screen wake lock while GenQueue has pending work keeps the display on so the
+     page isn't suspended.
+
+     DESIGN:
+       - Feature-detect navigator.wakeLock (older iOS lacks it → all no-ops).
+       - acquire() while there is pending work; release() when the queue drains.
+       - The OS auto-releases the lock when the page is hidden, so we reacquire on
+         visibilitychange→visible IF work is still pending.
+       - All failures are swallowed silently — a missing/blocked wake lock must
+         never break generation, only make it less reliable on the screen-lock path.
+       - Wired into GenQueue.pump (acquire) and the completion path (release when
+         no work remains).
+     =========================================================================== */
+  const WakeLock = (function () {
+    const supported = (typeof navigator !== "undefined") && !!navigator.wakeLock;
+    let sentinel = null;       // the active WakeLockSentinel, or null
+    let want = false;          // do we currently want a lock held?
+
+    function isSupported() { return supported; }
+    function isHeld() { return !!sentinel; }
+
+    async function acquire() {
+      want = true;
+      if (!supported || sentinel) return;
+      try {
+        sentinel = await navigator.wakeLock.request("screen");
+        // The OS releases on hide; drop our ref so a later reacquire() re-requests.
+        sentinel.addEventListener("release", function () { sentinel = null; });
+      } catch (_) {
+        sentinel = null;       // request rejected (hidden tab, unsupported) — silent
+      }
+    }
+
+    async function release() {
+      want = false;
+      if (!sentinel) return;
+      try { await sentinel.release(); } catch (_) {}
+      sentinel = null;
+    }
+
+    // Called on visibilitychange→visible: the lock auto-released while hidden, so
+    // re-request it if we still want one.
+    function reacquireIfWanted() {
+      if (want && !sentinel) acquire();
+    }
+
+    return {
+      isSupported: isSupported, isHeld: isHeld,
+      acquire: acquire, release: release, reacquireIfWanted: reacquireIfWanted
+    };
+  })();
 
   /* ===========================================================================
      [GEN QUEUE]  — SPE-21. Background listing generation.
@@ -2212,6 +2443,32 @@
       return (it && it.createdAt) ? it.createdAt : Date.now();
     }
 
+    // SPE-23: how long we wait before the single silent auto-retry of a transient
+    // failure. Module-level `let` so tests can scale it down without shipping the
+    // shortened value (via __setRetryDelay).
+    let RETRY_DELAY_MS = 3000;
+
+    // SPE-23: is this failure TRANSIENT (worth one silent auto-retry) vs. terminal
+    // (fail immediately)? The SPE-22 error objects carry `kind` ("timeout" |
+    // "network" | "http") and, for http, `apiStatus`. Transient kinds:
+    //   - timeout   : our own deadline or the overall-budget/max-continuations cap
+    //   - network   : couldn't reach Anthropic (flaky connection)
+    //   - http 529  : Anthropic overloaded
+    //   - http 5xx  : server-side error
+    // Non-transient (fail now, no retry): 401 (bad key), 400 (bad request),
+    // refusal, and parse/empty-draft (those don't carry a transient `kind`).
+    function isTransient(err) {
+      if (!err) return false;
+      const kind = err.kind;
+      if (kind === "timeout" || kind === "network") return true;
+      if (kind === "http") {
+        const st = err.apiStatus;
+        if (st === 529) return true;
+        if (typeof st === "number" && st >= 500 && st < 600) return true;
+      }
+      return false;
+    }
+
     // Start as many queued jobs as the concurrency cap allows.
     function pump() {
       while (active.size < MAX_CONCURRENT && queue.length > 0) {
@@ -2222,23 +2479,60 @@
         if (!item || item.gen !== "pending") continue;
         run(id);
       }
+      // SPE-23: hold a screen wake lock whenever there is pending work (in flight
+      // or queued) so iOS doesn't auto-lock and suspend the page mid-research.
+      syncWakeLock();
+    }
+
+    // SPE-23: acquire/release the screen wake lock to match pending work. Called
+    // from pump() (work may have started) and after each job settles (work may
+    // have drained). All WakeLock calls are silent no-ops when unsupported.
+    function syncWakeLock() {
+      if (typeof WakeLock === "undefined") return;
+      const busy = active.size > 0 || queue.length > 0;
+      if (busy) WakeLock.acquire();
+      else WakeLock.release();
     }
 
     // Run one generation. Never throws to the caller; resolves the item's gen
     // field one way or the other and always frees the slot + pumps the queue.
-    function run(itemId) {
+    // SPE-23: `attempt` is 0 for the first try, 1 for the single auto-retry.
+    function run(itemId, attempt) {
+      attempt = attempt || 0;
       active.add(itemId);
       const item = AppStore.getItem(itemId);
       const payload = payloadFor(item);
 
       AIListing.generate(payload).then(function (draft) {
         finishSuccess(itemId, draft);
+        settle(itemId);
       }).catch(function (err) {
+        // SPE-23: one silent auto-retry on a TRANSIENT failure. A fresh attempt
+        // with its own budget — no toast, no intermediate {failed} state written,
+        // gen stays "pending" so the research panel keeps showing. Free this slot
+        // first so the retry (and other queued items) can schedule fairly.
+        if (attempt === 0 && isTransient(err) && AppStore.getItem(itemId) &&
+            AppStore.getItem(itemId).gen === "pending") {
+          console.warn("[GenQueue] transient failure — auto-retrying once:", err && err.message);
+          active.delete(itemId);
+          setTimeout(function () {
+            // Re-check the item is still pending (not deleted / retried manually).
+            const cur = AppStore.getItem(itemId);
+            if (!cur || cur.gen !== "pending") { pump(); return; }
+            run(itemId, 1);
+          }, RETRY_DELAY_MS);
+          return;   // do NOT settle now — the retry owns the lifecycle
+        }
+        // Terminal (non-transient, or the retry itself failed): mark failed + toast.
         finishFailure(itemId, err);
-      }).then(function () {
-        active.delete(itemId);
-        pump();
+        settle(itemId);
       });
+    }
+
+    // Free the slot for a settled job and pump the queue + resync the wake lock.
+    function settle(itemId) {
+      active.delete(itemId);
+      pump();          // pump() calls syncWakeLock() at the end
     }
 
     function finishSuccess(itemId, draft) {
@@ -2280,8 +2574,85 @@
       showGenToast("Listing failed for “" + label + "” — tap to retry", itemId);
     }
 
-    return { enqueue: enqueue, pendingCount: pendingCount, startedAtFor: startedAtFor };
+    // SPE-23 feature 4: is this item actively tracked by a live in-memory job?
+    // A "pending" item with no live job means the fetch died while the page was
+    // suspended (a zombie) — nothing will ever resolve it.
+    function hasLiveJob(itemId) {
+      return active.has(itemId) || queue.indexOf(itemId) !== -1;
+    }
+
+    // SPE-23 feature 4: re-enqueue a single pending item as a FRESH attempt. Used
+    // by resumeZombies (visibility) and boot-time auto-requeue. enqueue() already
+    // guards against double-scheduling and resets gen "pending" + the elapsed
+    // anchor, so this is just a guarded pass-through.
+    function requeue(itemId) {
+      const it = AppStore.getItem(itemId);
+      if (!it) return;
+      enqueue(itemId);
+    }
+
+    // SPE-23 feature 4 (visibility path): scan for gen==="pending" items that have
+    // NO live in-memory job (their fetch died while the page was suspended) and
+    // silently re-enqueue them as fresh attempts. Safe to call repeatedly — items
+    // that already have a live job are skipped by hasLiveJob.
+    function resumeZombies() {
+      AppStore.listItems().forEach(function (it) {
+        if (it && it.gen === "pending" && !hasLiveJob(it.id)) {
+          console.warn("[GenQueue] resuming zombie pending job:", it.id);
+          requeue(it.id);
+        }
+      });
+    }
+
+    return {
+      enqueue: enqueue, pendingCount: pendingCount, startedAtFor: startedAtFor,
+      // SPE-23:
+      resumeZombies: resumeZombies, hasLiveJob: hasLiveJob, requeue: requeue,
+      isTransient: isTransient,
+      __setRetryDelay: function (ms) { if (typeof ms === "number") RETRY_DELAY_MS = ms; }
+    };
   })();
+
+  /* ===========================================================================
+     [GEN RESUME]  — SPE-23 feature 4 (boot path).
+     ---------------------------------------------------------------------------
+     migrate() normalizes any orphaned gen==="pending" to { failed: interrupted }
+     on both boot and import (see [DATA MODEL] / migrate). On LIVE BOOT we want to
+     go one better: if an AI mode is actually available, silently re-run those
+     interrupted jobs ONCE instead of forcing the user to tap Retry — the app
+     interrupted them, so the app should recover them.
+
+     - Only fires when an AI mode is available (aiModeAvailable): built-in runtime,
+       a saved API key, or mock. If genuinely nothing is available, the items keep
+       their { failed: interrupted } marker (a normal retry affordance), NOT a
+       stuck spinner.
+     - Matches the EXACT GEN_INTERRUPTED_MSG marker so it only touches items the
+       app itself interrupted — never a real user-facing failure like a 401.
+     - Requeue flips gen back to "pending" and enqueues a fresh attempt; if that
+       boot job then fails, the normal failure path applies (transient auto-retry,
+       else { failed } + toast).
+     - Runs ONCE per boot (right after AppStore.load()).
+     =========================================================================== */
+  // Is any AI generation mode available right now? mock is always the floor, so
+  // this is normally true; kept as an explicit, test-overridable predicate so the
+  // "no AI mode available" branch (items stay interrupted, not stuck) is testable.
+  let __aiModeForced = null;   // test seam: null = real, or a forced boolean
+  function aiModeAvailable() {
+    if (__aiModeForced !== null) return __aiModeForced;
+    // builtin / api / mock are the possible modes; all are "available" for
+    // generation. (mock produces clearly-labelled demo copy but still resolves.)
+    return AIListing.mode() != null;
+  }
+  function __setAiModeAvailable(v) { __aiModeForced = (v == null ? null : !!v); }
+
+  function resumeInterruptedOnBoot() {
+    if (!aiModeAvailable()) return;   // nothing can generate — leave interrupted markers
+    AppStore.listItems().forEach(function (it) {
+      if (it && it.gen && it.gen.failed === GEN_INTERRUPTED_MSG) {
+        GenQueue.requeue(it.id);      // gen -> "pending", fresh job enqueued
+      }
+    });
+  }
 
   /* ===========================================================================
      [SETTINGS]  — SPE-19. Modal overlay: API key management, connection test,
@@ -2399,6 +2770,8 @@
           '</div>' +
           '<div class="modal-body">' +
             modeCard + keyCard + backupCard +
+            // SPE-23: version line — small + muted at the very bottom of the sheet.
+            '<div class="settings-version">Version ' + escapeHtml(APP_VERSION) + '</div>' +
           '</div>' +
         '</div>' +
       '</div>';
@@ -4350,12 +4723,20 @@
     const pill = document.getElementById("genPill");
     if (!pill) return;
     const n = GenQueue.pendingCount();
-    if (n > 0) {
+    const genVisible = n > 0;
+    if (genVisible) {
       const txt = document.getElementById("genPillText");
       if (txt) txt.textContent = n + " researching";
       pill.classList.add("show");
     } else {
       pill.classList.remove("show");
+    }
+    // SPE-23: stack the update banner above the gen pill when BOTH are visible so
+    // they don't overlap. The update banner owns the higher slot (it's primary).
+    const banner = document.getElementById("updateBanner");
+    if (banner) {
+      const bannerVisible = banner.classList.contains("show");
+      banner.classList.toggle("with-gen-pill", bannerVisible && genVisible);
     }
   }
   // Set true around store mutations inside Add-flow handlers that will call
@@ -4446,12 +4827,48 @@
       if (document.visibilityState === "hidden") AppStore.flush();
     });
 
+    // SPE-23: on returning to the foreground, recover from a mid-research suspend.
+    //   - WakeLock: the OS auto-released the screen lock while hidden; reacquire it
+    //     if generation is still pending.
+    //   - GenQueue.resumeZombies: any gen==="pending" whose in-memory fetch died
+    //     while suspended has no live job — silently re-enqueue it.
+    // (UpdateCheck also listens for visible; it wires that itself in init().)
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible") {
+        WakeLock.reacquireIfWanted();
+        GenQueue.resumeZombies();
+      }
+    });
+
+    // SPE-23 test seams: exposed so the verification harness can drive the new
+    // modules without shipping shortened constants or real network calls.
+    if (typeof window !== "undefined") {
+      window.__thrift = {
+        APP_VERSION: APP_VERSION,
+        UpdateCheck: UpdateCheck,
+        WakeLock: WakeLock,
+        GenQueue: GenQueue,
+        AIListing: AIListing,
+        AppStore: AppStore,
+        resumeInterruptedOnBoot: resumeInterruptedOnBoot,
+        setAiModeAvailable: __setAiModeAvailable
+      };
+    }
+
     // Load persisted data + the API key (SPE-19) in parallel, then paint. The key
     // load determines the AI mode shown in the intake/loading copy and Settings.
     Promise.all([AppStore.load(), ApiKey.load()]).then(function () {
+      // SPE-23 feature 4 (boot path): auto-requeue jobs the app interrupted mid-
+      // research (migrate() flagged them with GEN_INTERRUPTED_MSG), once, when an
+      // AI mode is available. Must run AFTER ApiKey.load() so "api" mode is visible.
+      resumeInterruptedOnBoot();
+      // SPE-23 feature 1: start the stale-build update checker (boot + on-visible).
+      UpdateCheck.init();
       Router.go("add");
     }).catch(function (e) {
       console.error("[boot] load failed:", e);
+      // Still start the update checker even if data load failed.
+      try { UpdateCheck.init(); } catch (_) {}
       Router.go("add");
     });
   })();
