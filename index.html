@@ -763,6 +763,14 @@
     .btn.tiny { width: auto; font-size: 13px; padding: 8px 12px; }
     .settings-btn-row { display: flex; gap: 10px; }
     .settings-btn-row > * { flex: 1; }
+
+    /* SPE-20: "Copy debug info" on the generation-error step. Small + quiet so it
+       reads as a secondary escape hatch, consistent with other ghost buttons. */
+    .debug-copy-btn {
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--ink-soft);
+    }
   </style>
 </head>
 
@@ -964,6 +972,9 @@
      so data exports never leak it.
      =========================================================================== */
   const API_KEY_STORAGE = "thrift-ledger:apikey";
+  // SPE-20: last AI generation/validation failure snapshot, for user-reported bugs.
+  // Overwritten each failure; NEVER contains the API key.
+  const AI_DEBUG_STORAGE = "thrift-ledger:lastai-debug";
   const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
   const ANTHROPIC_VERSION = "2023-06-01";
   const ANTHROPIC_MODEL = "claude-opus-4-8";
@@ -1420,16 +1431,29 @@
       ].join("\n");
     }
 
-    // Scan a string for the LAST balanced {...} object that JSON.parse accepts.
-    // The direct-API web-search path can emit several text blocks; the final
-    // JSON object is the listing (earlier braces may appear in prose/results).
-    // Falls back to null if none parse.
+    // Does a parsed object look like our listing (vs. some other JSON, e.g. the
+    // nested `platforms` sub-object, a web-search result, or arbitrary prose
+    // JSON)? SPE-20: this is the key discriminator that stops the extractor from
+    // latching onto the wrong object.
+    function looksLikeListing(obj) {
+      if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+      return ("title" in obj) || ("suggestedPrice" in obj) ||
+             (obj.platforms && typeof obj.platforms === "object");
+    }
+
+    // Scan a string for the balanced {...} object that is our listing.
+    // The direct-API web-search path can emit several text blocks and the JSON
+    // itself contains a nested `platforms` object, so "last object that parses"
+    // is NOT sufficient — it would pick the nested platforms block. We collect
+    // every TOP-LEVEL parseable object (skipping any nested inside one we've
+    // already consumed) and prefer the last one that looks like a listing;
+    // failing that, the last top-level object that parsed at all.
     function extractLastJsonObject(s) {
-      let best = null;
-      // Walk every "{" and, for each, find its matching "}" via brace-depth,
-      // trying to parse the slice. Keep the last one that parses.
+      let bestListing = null;   // last top-level object with listing shape
+      let bestAny = null;       // last top-level object that parsed
+      let scanFrom = 0;         // skip past the span of an already-consumed object
       for (let i = 0; i < s.length; i++) {
-        if (s[i] !== "{") continue;
+        if (s[i] !== "{" || i < scanFrom) continue;
         let depth = 0, inStr = false, esc = false;
         for (let j = i; j < s.length; j++) {
           const ch = s[j];
@@ -1447,14 +1471,19 @@
               const candidate = s.slice(i, j + 1);
               try {
                 const obj = JSON.parse(candidate);
-                if (obj && typeof obj === "object" && !Array.isArray(obj)) best = obj;
-              } catch (_) { /* not valid JSON, keep scanning */ }
+                if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+                  bestAny = obj;
+                  if (looksLikeListing(obj)) bestListing = obj;
+                  // Don't descend into this object's nested braces — jump past it.
+                  scanFrom = j + 1;
+                }
+              } catch (_) { /* not valid JSON at this "{"; keep scanning inward */ }
               break;
             }
           }
         }
       }
-      return best;
+      return bestListing || bestAny;
     }
 
     // Defensive parse of the model's text -> listing object (or throw).
@@ -1501,13 +1530,55 @@
       return parseResponse(text);
     }
 
-    /* ---- Direct Anthropic Messages API (SPE-19) ----
+    /* ---- Direct Anthropic Messages API (SPE-19 / SPE-20) ----
        Browser CORS requires anthropic-dangerous-direct-browser-access: true.
        Web search is server-executed; the response content array mixes block
        types (server_tool_use, web_search_tool_result, text, empty thinking).
        We handle pause_turn (server tool loop paused) by re-sending with the
        assistant content appended, up to API_MAX_CONTINUATIONS times, and map
-       HTTP errors + stop_reasons to friendly messages. */
+       HTTP errors + stop_reasons to friendly messages.
+
+       SPE-20: we also request structured outputs (output_config.format) so the
+       final text block is guaranteed to be exactly the listing JSON. If that
+       interacts badly with the web_search tool (a 400 mentioning output_config
+       / format), we retry ONCE without it and remember the failure for the rest
+       of the session (structuredOutputsBroken) so later generations skip it. And
+       we accumulate text blocks across every pause_turn chunk, not just the
+       terminal response, so the draft JSON is found even if it arrived earlier. */
+
+    // Session flag: once the API rejects output_config (e.g. web_search combo),
+    // stop sending it and fall back to text-scraping for the rest of the session.
+    let structuredOutputsBroken = false;
+
+    // JSON schema for the listing. NOTE (SPE-20): no numeric constraints
+    // (minimum/maximum) or minLength — those are unsupported by structured
+    // outputs and would 400.
+    const LISTING_OUTPUT_CONFIG = {
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            description: { type: "string" },
+            suggestedPrice: { type: "number" },
+            platforms: {
+              type: "object",
+              properties: {
+                poshmark: { type: "string" },
+                ebay: { type: "string" },
+                mercari: { type: "string" },
+                depop: { type: "string" }
+              },
+              required: ["poshmark", "ebay", "mercari", "depop"],
+              additionalProperties: false
+            }
+          },
+          required: ["title", "description", "suggestedPrice", "platforms"],
+          additionalProperties: false
+        }
+      }
+    };
 
     // Map a fetch/HTTP failure to a friendly, user-facing message.
     function apiErrorMessage(status) {
@@ -1544,7 +1615,15 @@
       }
       if (timer) clearTimeout(timer);
       if (!res.ok) {
-        throw new Error(apiErrorMessage(res.status));
+        // Read the body so callers can inspect the error (SPE-20: detect a 400
+        // that names output_config/format so we can retry without it). We still
+        // surface a friendly message; the raw text rides along on err.apiBody.
+        let bodyText = "";
+        try { bodyText = await res.text(); } catch (_) {}
+        const err = new Error(apiErrorMessage(res.status));
+        err.apiStatus = res.status;
+        err.apiBody = bodyText;
+        throw err;
       }
       try {
         return await res.json();
@@ -1553,20 +1632,68 @@
       }
     }
 
-    async function generateApi(payload) {
-      const key = ApiKey.get();
-      if (!key) throw new Error("No API key configured. Add one in Settings.");
+    // SPE-20: does this failure look like the API rejecting output_config/format?
+    // (Possible interaction with the web_search tool.) If so we retry once
+    // without structured outputs and remember it for the session.
+    function isOutputConfigError(err) {
+      if (!err || err.apiStatus !== 400) return false;
+      const body = (err.apiBody || "").toLowerCase();
+      return body.indexOf("output_config") !== -1 || body.indexOf("format") !== -1;
+    }
 
-      const messages = [{ role: "user", content: buildPrompt(payload, true) }];
+    // SPE-20: persist a redacted debug snapshot of a failed/rejected generation so
+    // the user can copy it back to the developer. Overwrites each time; the API
+    // key is never part of `response`, so nothing sensitive is stored.
+    function captureAiDebug(response) {
+      try {
+        const content = (response && Array.isArray(response.content)) ? response.content : [];
+        const blockTypes = content.map(function (b) {
+          return (b && b.type) ? b.type : "unknown";
+        });
+        const text = content
+          .filter(function (b) { return b && b.type === "text" && typeof b.text === "string"; })
+          .map(function (b) { return b.text; })
+          .join("\n")
+          .slice(0, 20000);
+        const snapshot = {
+          when: new Date().toISOString(),
+          stop_reason: (response && response.stop_reason) || null,
+          contentBlockTypes: blockTypes,
+          text: text
+        };
+        // Fire-and-forget; storage is async and failure here must not break the flow.
+        Storage.set(AI_DEBUG_STORAGE, snapshot);
+      } catch (_) { /* debug capture must never throw */ }
+    }
+
+    // Build the request body. `useStructured` gates output_config (SPE-20).
+    function buildApiBody(messages, useStructured) {
+      const body = {
+        model: ANTHROPIC_MODEL,
+        max_tokens: 8000,
+        tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 4 }],
+        messages: messages
+      };
+      if (useStructured) body.output_config = LISTING_OUTPUT_CONFIG;
+      return body;
+    }
+
+    // Run the pause_turn continuation loop and return the ACCUMULATED content
+    // blocks across every chunk (SPE-20 fix 3), plus the terminal response for
+    // stop_reason inspection. Throws on terminal error stop_reasons.
+    async function runApiLoop(key, messages, useStructured) {
+      // Collect ALL content blocks from every response, in order. With structured
+      // outputs the draft is in the final chunk anyway, but the fallback path
+      // needs earlier chunks in case the JSON landed in a pause_turn chunk.
+      const accumulated = [];
       let response = null;
 
       for (let attempt = 0; attempt <= API_MAX_CONTINUATIONS; attempt++) {
-        response = await apiRequest(key, {
-          model: ANTHROPIC_MODEL,
-          max_tokens: 8000,
-          tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 4 }],
-          messages: messages
-        });
+        response = await apiRequest(key, buildApiBody(messages, useStructured));
+
+        if (response && Array.isArray(response.content)) {
+          for (let i = 0; i < response.content.length; i++) accumulated.push(response.content[i]);
+        }
 
         const stop = response && response.stop_reason;
         if (stop === "pause_turn") {
@@ -1583,14 +1710,51 @@
         if (stop === "refusal") {
           throw new Error("The AI declined to generate this listing.");
         }
-        // end_turn (or anything else terminal) — parse and return.
+        // end_turn (or anything else terminal) — stop looping.
         break;
       }
 
       if (!response || !Array.isArray(response.content)) {
         throw new Error("The AI returned no listing. Try again.");
       }
-      return parseResponse(response.content);
+      // Return a synthetic response whose content is the accumulated blocks so
+      // parseResponse + debug capture see every text block from the whole turn.
+      return {
+        stop_reason: response.stop_reason,
+        content: accumulated,
+        _terminal: response
+      };
+    }
+
+    async function generateApi(payload) {
+      const key = ApiKey.get();
+      if (!key) throw new Error("No API key configured. Add one in Settings.");
+
+      // Structured outputs guarantee the final text block is the listing JSON —
+      // unless we've already learned this session that the API rejects it.
+      const useStructured = !structuredOutputsBroken;
+      let result;
+      try {
+        result = await runApiLoop(key, [{ role: "user", content: buildPrompt(payload, true) }], useStructured);
+      } catch (err) {
+        if (useStructured && isOutputConfigError(err)) {
+          // Structured outputs + web_search interaction failed. Remember it for
+          // the session and retry ONCE without output_config (graceful degrade).
+          structuredOutputsBroken = true;
+          result = await runApiLoop(key, [{ role: "user", content: buildPrompt(payload, true) }], false);
+        } else {
+          throw err;
+        }
+      }
+
+      try {
+        return parseResponse(result.content);
+      } catch (parseErr) {
+        // Couldn't extract a listing from the accumulated text — snapshot for the
+        // user to report, then rethrow so the UI shows the error/retry step.
+        captureAiDebug(result);
+        throw parseErr;
+      }
     }
 
     // Minimal real request used by the Settings "Test" button. Small, no tools,
@@ -1655,7 +1819,25 @@
     return {
       isLive: isLive, mode: mode, generate: generate,
       buildPrompt: buildPrompt, parseResponse: parseResponse,
-      testKey: testKey
+      testKey: testKey,
+      // SPE-20: debug capture. captureAiDebug stores a redacted snapshot; used by
+      // both the parse-failure path (inside generateApi) and the draft-validation
+      // path (in the add flow). captureRawDebug builds a snapshot from a plain
+      // draft object for the non-API (builtin/mock) validation-failure case.
+      captureAiDebug: captureAiDebug,
+      captureRawDebug: function (draft, stopReason) {
+        try {
+          Storage.set(AI_DEBUG_STORAGE, {
+            when: new Date().toISOString(),
+            stop_reason: stopReason || null,
+            contentBlockTypes: [],
+            text: (function () {
+              try { return JSON.stringify(draft).slice(0, 20000); }
+              catch (_) { return ""; }
+            })()
+          });
+        } catch (_) { /* never throw */ }
+      }
     };
   })();
 
@@ -2241,6 +2423,8 @@
         '<p class="muted">' + escapeHtml(addState.genError || "Something went wrong.") + '</p>' +
         '<button class="btn" id="retryGenBtn" type="button">Retry</button>' +
         '<button class="btn secondary" id="manualFillBtn" type="button" style="margin-top:10px;">Fill in manually</button>' +
+        // SPE-20: lets the user copy a redacted debug snapshot to send to the dev.
+        '<button class="btn ghost debug-copy-btn" id="copyDebugBtn" type="button">Copy debug info</button>' +
       '</div>';
   }
 
@@ -2374,6 +2558,21 @@
         addState.draft = AppStore.makeListing({ suggestedPrice: "" });
         addState.step = "review";
         renderAdd();
+      });
+      // SPE-20: copy the stored debug snapshot (redacted; never the key) so the
+      // user can paste it back to the developer.
+      const dbg = document.getElementById("copyDebugBtn");
+      if (dbg) dbg.addEventListener("click", async function () {
+        let snapshot = null;
+        try { snapshot = await Storage.get(AI_DEBUG_STORAGE); } catch (_) {}
+        if (!snapshot) {
+          showCopiedToast("No debug info yet.");
+          return;
+        }
+        let json;
+        try { json = JSON.stringify(snapshot, null, 2); }
+        catch (_) { json = String(snapshot); }
+        copyText(json, dbg);
       });
     }
 
@@ -2524,14 +2723,38 @@
 
     try {
       const draft = await AIListing.generate(res.payload);
-      addState.draft = normalizeDraft(draft);
-      addState.step = "review";
+      const normalized = normalizeDraft(draft);
+      // SPE-20 safety net: a normalized draft with an empty title AND all four
+      // empty platform texts means generation produced nothing usable (the
+      // extractor latched onto the wrong JSON, or the draft JSON was missing).
+      // Treat it exactly like a generation failure — never show a blank review.
+      if (!isDraftUsable(normalized)) {
+        AIListing.captureRawDebug(draft, "empty_draft");
+        addState.genError = "The AI returned an empty draft — tap Retry";
+        addState.step = "error";
+      } else {
+        addState.draft = normalized;
+        addState.step = "review";
+      }
     } catch (err) {
       console.warn("[AIListing] generate failed:", err);
       addState.genError = (err && err.message) ? err.message : "The AI didn't return a usable listing.";
       addState.step = "error";
     }
     renderAdd();
+  }
+
+  // SPE-20: a draft is usable if it has a non-empty title OR at least one
+  // non-empty platform text. Anything less is a blank review — reject it.
+  function isDraftUsable(d) {
+    if (!d || typeof d !== "object") return false;
+    if (typeof d.title === "string" && d.title.trim() !== "") return true;
+    const plats = d.platforms || {};
+    for (let i = 0; i < PLATFORMS.length; i++) {
+      const v = plats[PLATFORMS[i]];
+      if (typeof v === "string" && v.trim() !== "") return true;
+    }
+    return false;
   }
 
   // Coerce whatever generate() returned into a clean listing object.
