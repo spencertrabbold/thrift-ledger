@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- app-version: 2026-07-05.2 -->
+<!-- app-version: 2026-07-05.3 -->
 <!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
      constant (search for `const APP_VERSION =`) MUST stay identical. The
      orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
@@ -741,7 +741,8 @@
       background: var(--ink-faint);
     }
     .mode-indicator.builtin .dot,
-    .mode-indicator.api .dot { background: var(--good); }
+    .mode-indicator.api .dot,
+    .mode-indicator.cloud .dot { background: var(--good); }
     .mode-indicator.mock .dot { background: var(--warn); }
 
     .privacy-note {
@@ -1007,9 +1008,24 @@
                             //     { failed: msg }  - last generation failed; `msg` is a
                             //                        friendly, user-facing reason (retry from
                             //                        item detail re-enqueues -> back to "pending").
-                            //   migrate() normalizes any loaded "pending" (app died mid-research)
-                            //   to { failed: "Interrupted — tap to retry" }. No SCHEMA_VERSION
-                            //   bump: this is an optional additive field.
+                            //   migrate() normalizes any loaded LOCAL "pending" (app died mid-
+                            //   research, no genJob) to { failed: "Interrupted — tap to retry" }.
+                            //   A CLOUD "pending" (has genJob) is LEFT ALONE by migrate() — the
+                            //   server job survives app death, so boot resumes polling instead
+                            //   (see CloudPoll / resumeCloudOnBoot). No SCHEMA_VERSION bump: both
+                            //   gen and genJob are optional additive fields.
+
+       genJob:    string (optional)
+                            //   SPE-25 cloud research. The Cloudflare Worker job UUID for THIS
+                            //   item's in-flight cloud generation. Present ONLY while gen ===
+                            //   "pending" in cloud mode; the DURABLE handle CloudPoll uses to
+                            //   poll GET /jobs and match a returned job back to its item. Set
+                            //   alongside gen:"pending" on a cloud POST /jobs; CLEARED (delete)
+                            //   the moment the job resolves (done/failed/unknown) or is retried.
+                            //   Absent for local-mode generations. migrate() leaves it untouched.
+                            //   NEVER exported (lives in the data blob but is a transient handle;
+                            //   an imported genJob for a now-unknown server job simply polls
+                            //   "unknown" once and self-clears).
      }
 
      Bundle = {                     // one multi-item sale (SPE-13)
@@ -1062,7 +1078,7 @@
      copy proved the page was stale). appVersion is also stamped into every AI
      debug snapshot so failure reports say which build produced them.
      =========================================================================== */
-  const APP_VERSION = "2026-07-05.2";
+  const APP_VERSION = "2026-07-05.3";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -1123,6 +1139,12 @@
      so data exports never leak it.
      =========================================================================== */
   const API_KEY_STORAGE = "thrift-ledger:apikey";
+  // SPE-25: Cloud research settings — the Cloudflare Worker URL + app bearer token.
+  // Stored under their OWN keys (like API_KEY_STORAGE), NEVER inside the data blob
+  // and NEVER in exports, so a backup can't leak the token. The key lives server-
+  // side in cloud mode; these two values are all the phone needs to reach it.
+  const CLOUD_URL_STORAGE = "thrift-ledger:cloudurl";
+  const CLOUD_TOKEN_STORAGE = "thrift-ledger:cloudtoken";
   // SPE-20: last AI generation/validation failure snapshot, for user-reported bugs.
   // Overwritten each failure; NEVER contains the API key.
   const AI_DEBUG_STORAGE = "thrift-ledger:lastai-debug";
@@ -1304,6 +1326,93 @@
   })();
 
   /* ===========================================================================
+     [CLOUD SETTINGS]  — SPE-25. Cloudflare Worker URL + app token, each under its
+     OWN storage key (mirrors ApiKey). Never in the data blob, never in exports.
+     ---------------------------------------------------------------------------
+     Cloud mode runs listing research SERVER-SIDE so a job survives the phone being
+     locked / backgrounded / killed. It is INDEPENDENT of the on-device Anthropic
+     key (the Anthropic key lives on the worker in this mode — that's the point).
+       CloudSettings.url()   -> normalized worker base URL (no trailing slash) | null
+       CloudSettings.token() -> app bearer token | null
+       CloudSettings.configured() -> true iff BOTH url and token are set
+     URL normalization: trim, strip trailing slash. https:// is REQUIRED, EXCEPT we
+     allow http://localhost (and http://127.0.0.1) so local `wrangler dev` works.
+     =========================================================================== */
+  const CloudSettings = (function () {
+    let cachedUrl = null;
+    let cachedToken = null;
+    let loaded = false;
+
+    // Is this a permitted URL? https:// anywhere; http:// only for localhost/127.0.0.1.
+    function isAllowedUrl(raw) {
+      const u = (raw == null ? "" : String(raw)).trim();
+      if (!u) return false;
+      if (/^https:\/\//i.test(u)) return true;
+      if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(u)) return true;
+      return false;
+    }
+    // Normalize for storage/use: trim + strip a single trailing slash. Returns "" if
+    // the input isn't an allowed URL (caller decides how to surface that).
+    function normalizeUrl(raw) {
+      const u = (raw == null ? "" : String(raw)).trim();
+      if (!isAllowedUrl(u)) return "";
+      return u.replace(/\/+$/, "");
+    }
+
+    async function load() {
+      try {
+        const u = await Storage.get(CLOUD_URL_STORAGE);
+        cachedUrl = (typeof u === "string" && u.trim()) ? u.trim().replace(/\/+$/, "") : null;
+      } catch (_) { cachedUrl = null; }
+      try {
+        const t = await Storage.get(CLOUD_TOKEN_STORAGE);
+        cachedToken = (typeof t === "string" && t.trim()) ? t.trim() : null;
+      } catch (_) { cachedToken = null; }
+      loaded = true;
+      return { url: cachedUrl, token: cachedToken };
+    }
+
+    function url() { return cachedUrl; }
+    function token() { return cachedToken; }
+    function configured() { return !!(cachedUrl && cachedToken); }
+
+    // Save both fields together. Returns { ok:true } or { ok:false, message }.
+    async function save(rawUrl, rawToken) {
+      const u = (rawUrl == null ? "" : String(rawUrl)).trim();
+      const t = (rawToken == null ? "" : String(rawToken)).trim();
+      if (!u || !t) return { ok: false, message: "Enter both a worker URL and an app password." };
+      if (!isAllowedUrl(u)) return { ok: false, message: "Worker URL must start with https:// (http:// allowed only for localhost)." };
+      const norm = normalizeUrl(u);
+      cachedUrl = norm;
+      cachedToken = t;
+      await Storage.set(CLOUD_URL_STORAGE, norm);
+      await Storage.set(CLOUD_TOKEN_STORAGE, t);
+      return { ok: true };
+    }
+
+    async function clear() {
+      cachedUrl = null;
+      cachedToken = null;
+      await Storage.delete(CLOUD_URL_STORAGE);
+      await Storage.delete(CLOUD_TOKEN_STORAGE);
+    }
+
+    // Masked token for display — never reveal the full app password on screen.
+    function maskedToken() {
+      if (!cachedToken) return "";
+      if (cachedToken.length <= 4) return "••••";
+      return "••••" + cachedToken.slice(-4);
+    }
+
+    return {
+      load: load, url: url, token: token, configured: configured,
+      save: save, clear: clear, maskedToken: maskedToken,
+      isAllowedUrl: isAllowedUrl, normalizeUrl: normalizeUrl,
+      isLoaded: function () { return loaded; }
+    };
+  })();
+
+  /* ===========================================================================
      [STORE]  — AppStore: single source of truth.
      ---------------------------------------------------------------------------
      Holds { schemaVersion, items, bundles }. Views subscribe(); every mutator
@@ -1379,8 +1488,12 @@
       // user doesn't have to manually retry a job the app itself interrupted. Design
       // choice: keep one normalization here + a boot-only resume pass, rather than
       // threading a boot/import discriminator through migrate() (see BOOT section).
+      // SPE-25: a CLOUD "pending" (item.genJob set) is DIFFERENT — the server job
+      // survives the app dying, so we must NOT flip it to interrupted. Leave those
+      // alone; resumeCloudOnBoot() resumes POLLING for them (the headline feature).
+      // Only LOCAL pending (no genJob) is orphaned by an app death.
       blob.items.forEach(function (it) {
-        if (it && it.gen === "pending") {
+        if (it && it.gen === "pending" && !it.genJob) {
           it.gen = { failed: GEN_INTERRUPTED_MSG };
         }
       });
@@ -1550,11 +1663,17 @@
              window.claude &&
              typeof window.claude.complete === "function";
     }
-    // Active provider (SPE-19). Chain: window.claude -> direct API -> mock.
+    // Active provider (SPE-19 / SPE-25). Chain:
+    //   cloud -> window.claude -> direct API -> mock.
+    //   "cloud"   -> Cloudflare Worker (URL+token configured). Runs research server-
+    //                side so a job survives the phone locking/backgrounding/dying.
+    //                INDEPENDENT of the on-device Anthropic key (key lives on the
+    //                worker). Takes precedence over everything when configured.
     //   "builtin" -> window.claude.complete   (real research, artifact host)
     //   "api"     -> direct Anthropic Messages API with the user's key
     //   "mock"    -> local placeholder generator
     function mode() {
+      if (typeof CloudSettings !== "undefined" && CloudSettings.configured()) return "cloud";
       if (hasClaudeComplete()) return "builtin";
       if (ApiKey.has()) return "api";
       return "mock";
@@ -2262,6 +2381,126 @@
       }
     }
 
+    /* ---- CLOUD (SPE-25) — Cloudflare Worker job client. ----
+       The worker (worker/src/index.js) exposes:
+         POST   /jobs         body {payload:{brand,category,size,condition,costPaid,hasPhoto}}
+                              -> 202 {id,status:"pending"}
+         GET    /jobs?ids=a,b -> {jobs:[{id,status,draft?,error?,...}]}
+         DELETE /jobs?ids=... -> {deleted:[...]}
+       All requests carry Authorization: Bearer <app token>. We NEVER send the photo
+       data — only hasPhoto = !!photo (the worker emits the identical "a photo is
+       available" prompt line the app does). The heavy Anthropic call runs server-
+       side, so these are all short fetches. Errors are tagged like the direct-API
+       errors (err.kind + err.apiStatus) so GenQueue's transient/terminal classifier
+       and debug capture work unchanged. */
+
+    // Map hasPhoto + structured fields into the worker's job payload. Deliberately
+    // omits the photo dataURL (server-side research is text-only, like the app's).
+    function cloudJobPayload(payload) {
+      return {
+        brand: payload.brand || "",
+        category: payload.category || "",
+        size: payload.size || "",
+        condition: payload.condition || "",
+        costPaid: Number(payload.costPaid) || 0,
+        hasPhoto: !!payload.photo
+      };
+    }
+
+    // Friendly message for a cloud HTTP status (POST or poll auth failure).
+    function cloudErrorMessage(status) {
+      if (status === 401) return "Cloud token rejected — check Settings";
+      if (status === 429) return "Cloud is rate limited — try again in a minute.";
+      if (status === 529 || (status >= 500 && status < 600)) return "The cloud worker is busy — try again.";
+      return "The cloud request failed (HTTP " + status + "). Try again.";
+    }
+
+    // Low-level fetch to the worker. `path` includes leading slash + any query.
+    // Returns the parsed JSON on 2xx; throws a tagged Error otherwise (err.kind =
+    // "http"|"network", err.apiStatus for http). No AbortController deadline — these
+    // are quick control-plane calls, not the multi-minute research fetch.
+    async function cloudFetch(method, path, bodyObj) {
+      const base = CloudSettings.url();
+      const token = CloudSettings.token();
+      if (!base || !token) {
+        const err = new Error("Cloud research isn't configured.");
+        err.kind = "config";
+        throw err;
+      }
+      let res;
+      try {
+        res = await fetch(base + path, {
+          method: method,
+          headers: Object.assign(
+            { "Authorization": "Bearer " + token },
+            bodyObj ? { "content-type": "application/json" } : {}
+          ),
+          body: bodyObj ? JSON.stringify(bodyObj) : undefined
+        });
+      } catch (e) {
+        const err = new Error("Couldn't reach the cloud worker — check your connection and Settings.");
+        err.kind = "network";
+        err.rawMessage = (e && e.message) ? String(e.message) : String(e);
+        throw err;
+      }
+      if (!res.ok) {
+        let bodyText = "";
+        try { bodyText = await res.text(); } catch (_) {}
+        const err = new Error(cloudErrorMessage(res.status));
+        err.kind = "http";
+        err.apiStatus = res.status;
+        err.apiBody = bodyText;
+        throw err;
+      }
+      try {
+        return await res.json();
+      } catch (e) {
+        const err = new Error("The cloud worker returned an unreadable response. Try again.");
+        err.kind = "http";
+        err.apiStatus = res.status;
+        err.apiBody = "";
+        throw err;
+      }
+    }
+
+    // POST /jobs — submit a research job. Returns { id, status }. Throws tagged.
+    function cloudSubmit(payload) {
+      return cloudFetch("POST", "/jobs", { payload: cloudJobPayload(payload) });
+    }
+    // GET /jobs?ids=a,b,c — batched poll. `ids` is an array. Returns { jobs:[...] }.
+    function cloudPoll(ids) {
+      const q = encodeURIComponent((ids || []).join(","));
+      return cloudFetch("GET", "/jobs?ids=" + q, null);
+    }
+    // DELETE /jobs?ids=a,b — best-effort cleanup after consuming results.
+    function cloudDelete(ids) {
+      const q = encodeURIComponent((ids || []).join(","));
+      return cloudFetch("DELETE", "/jobs?ids=" + q, null);
+    }
+
+    // Connection test for the Settings "Test" button: GET /jobs?ids=ping.
+    // 200 => connected; 401 => token rejected; else mapped message.
+    async function testCloud(rawUrl, rawToken) {
+      const base = CloudSettings.normalizeUrl(rawUrl);
+      const token = (rawToken == null ? "" : String(rawToken)).trim();
+      if (!CloudSettings.isAllowedUrl(rawUrl)) {
+        return { ok: false, message: "Worker URL must start with https:// (http:// allowed only for localhost)." };
+      }
+      if (!token) return { ok: false, message: "Enter the app password to test." };
+      let res;
+      try {
+        res = await fetch(base + "/jobs?ids=ping", {
+          method: "GET",
+          headers: { "Authorization": "Bearer " + token }
+        });
+      } catch (e) {
+        return { ok: false, message: "Couldn't reach the worker — check the URL and your connection." };
+      }
+      if (res.status === 200) return { ok: true };
+      if (res.status === 401) return { ok: false, message: "Token rejected — check the app password" };
+      return { ok: false, message: cloudErrorMessage(res.status) };
+    }
+
     // ---- MOCK (dev only) — clearly labelled placeholder content. ----
     function generateMock(payload) {
       return new Promise(function (resolve) {
@@ -2309,6 +2548,12 @@
       isLive: isLive, mode: mode, generate: generate,
       buildPrompt: buildPrompt, parseResponse: parseResponse,
       testKey: testKey,
+      // SPE-25: cloud worker client. GenQueue drives the POST/poll/DELETE lifecycle
+      // (cloud mode is submit-then-poll, NOT the promise-returning generate() path).
+      // parseResponse/sanitizeDraft/draftLooksBroken reuse the EXISTING pipeline on
+      // the returned draft. testCloud powers the Settings "Test" button.
+      cloudSubmit: cloudSubmit, cloudPoll: cloudPoll, cloudDelete: cloudDelete,
+      testCloud: testCloud,
       // SPE-20: debug capture. captureAiDebug stores a redacted snapshot; used by
       // both the parse-failure path (inside generateApi) and the draft-validation
       // path (in the add flow). captureRawDebug builds a snapshot from a plain
@@ -2345,6 +2590,7 @@
   // Human-readable label for the active AI mode (shown in Settings + loading copy).
   function aiModeLabel() {
     switch (AIListing.mode()) {
+      case "cloud":   return "Cloud research (worker)";
       case "builtin": return "Claude (built-in)";
       case "api":     return "Claude API (your key)";
       default:        return "Demo mode";
@@ -2568,15 +2814,93 @@
     }
 
     // Enqueue (or re-enqueue, for a retry) generation for an item id. Sets gen
-    // "pending" durably, then tries to start it (respecting the concurrency cap).
+    // "pending" durably, then tries to start it.
+    // SPE-25: in CLOUD mode we branch entirely — submit a server job immediately
+    // (NOT subject to the local cap-2; the worker handles concurrency), persist the
+    // returned job id on item.genJob, and let CloudPoll pick up the result. In LOCAL
+    // modes (builtin/api/mock) the behavior is unchanged: cap-2 FIFO queue.
     function enqueue(itemId) {
       const item = AppStore.getItem(itemId);
       if (!item) return;
+      if (AIListing.mode() === "cloud") { enqueueCloud(itemId); return; }
       startedAt[itemId] = Date.now();                  // SPE-22: elapsed-timer anchor
-      AppStore.updateItem(itemId, { gen: "pending" }); // durable pending -> notify re-renders badges
+      AppStore.updateItem(itemId, { gen: "pending", genJob: undefined }); // durable pending -> notify re-renders badges
       if (active.has(itemId) || queue.indexOf(itemId) !== -1) return; // already scheduled
       queue.push(itemId);
       pump();
+    }
+
+    // SPE-25: submit a cloud research job for this item. Sets gen "pending" up front
+    // (research panel shows immediately), then POSTs. On success persist the job id
+    // durably on item.genJob and kick CloudPoll. On failure: transient -> the same
+    // auto-retry ladder as local (re-submit); 401 (token rejected) -> terminal fail
+    // with the Settings message. NOT gated by the cap — submit immediately.
+    function enqueueCloud(itemId) {
+      const item = AppStore.getItem(itemId);
+      if (!item) return;
+      startedAt[itemId] = Date.now();                  // elapsed-timer anchor (best-effort)
+      // Mark pending now; clear any stale genJob until the POST returns a fresh one.
+      AppStore.updateItem(itemId, { gen: "pending", genJob: undefined });
+      submitCloudJob(itemId, 0);
+    }
+
+    // POST /jobs for an item, with the same transient auto-retry ladder as local.
+    // `attempt` is 0 for the first try, 1/2 for retries.
+    function submitCloudJob(itemId, attempt) {
+      attempt = attempt || 0;
+      const item = AppStore.getItem(itemId);
+      if (!item || item.gen !== "pending") return;     // deleted / superseded
+      const payload = payloadFor(item);
+      AIListing.cloudSubmit(payload).then(function (res) {
+        const cur = AppStore.getItem(itemId);
+        if (!cur || cur.gen !== "pending") return;     // deleted / superseded mid-flight
+        const jobId = res && res.id;
+        if (!jobId) {
+          markFailed(itemId, "The cloud didn't accept the job — tap Retry");
+          return;
+        }
+        // Persist the durable job handle. CloudPoll will now find + poll it.
+        AppStore.updateItem(itemId, { gen: "pending", genJob: jobId });
+        CloudPoll.kick();                              // start/continue polling now
+      }).catch(function (err) {
+        // 401 -> terminal, clear Settings message. Other transient -> retry ladder.
+        if (err && err.kind === "http" && err.apiStatus === 401) {
+          captureCloudFailureDebug(itemId, err, null);
+          markFailed(itemId, "Cloud token rejected — check Settings");
+          return;
+        }
+        if (attempt < MAX_TRANSIENT_RETRIES && isTransient(err) &&
+            AppStore.getItem(itemId) && AppStore.getItem(itemId).gen === "pending") {
+          const retryN = attempt + 1;
+          const backoff = transientBackoff(retryN, err);
+          console.warn("[GenQueue] cloud POST transient failure — auto-retry " + retryN + "/" +
+            MAX_TRANSIENT_RETRIES + " in " + backoff + "ms:", err && err.message);
+          setTimeout(function () {
+            const c = AppStore.getItem(itemId);
+            if (!c || c.gen !== "pending") return;
+            submitCloudJob(itemId, attempt + 1);
+          }, backoff);
+          return;
+        }
+        // Terminal POST failure.
+        captureCloudFailureDebug(itemId, err, null);
+        markFailed(itemId, (err && err.message) ? err.message : "Couldn't reach the cloud worker — tap Retry");
+      });
+    }
+
+    // SPE-25 debug: record a cloud failure into the EXISTING lastFailure slot with
+    // mode:"cloud", the worker http status, and the jobId (never the token).
+    function captureCloudFailureDebug(itemId, err, jobId) {
+      try {
+        const cur = AppStore.getItem(itemId);
+        AIListing.captureRawDebug({}, "cloud", {
+          kind: "cloud",
+          mode: "cloud",
+          httpStatus: (err && err.apiStatus != null) ? err.apiStatus : null,
+          message: (err && err.message) ? err.message : null,
+          jobId: jobId || (cur && cur.genJob) || null
+        });
+      } catch (_) {}
     }
 
     // SPE-22: epoch ms this item's current research started (for the elapsed timer).
@@ -2647,9 +2971,13 @@
       syncWakeLock();
     }
 
-    // SPE-23: acquire/release the screen wake lock to match pending work. Called
-    // from pump() (work may have started) and after each job settles (work may
-    // have drained). All WakeLock calls are silent no-ops when unsupported.
+    // SPE-23/SPE-25: acquire/release the screen wake lock to match pending LOCAL
+    // work. Called from pump() (work may have started) and after each job settles
+    // (work may have drained). All WakeLock calls are silent no-ops when unsupported.
+    // IMPORTANT (SPE-25): only LOCAL jobs need the screen awake — the whole point of
+    // cloud mode is that the server keeps working while the phone sleeps, so cloud
+    // jobs must NOT hold a wake lock (battery win). `active`/`queue` only ever hold
+    // LOCAL ids (cloud submits never push to them), so this is already cloud-safe.
     function syncWakeLock() {
       if (typeof WakeLock === "undefined") return;
       const busy = active.size > 0 || queue.length > 0;
@@ -2778,6 +3106,65 @@
       pump();          // pump() calls syncWakeLock() at the end
     }
 
+    // SPE-25: track how many quality regens a given cloud item has spent (in-memory;
+    // a fresh page load resets it, which is fine — worst case one extra regen).
+    const cloudQualityRegens = Object.create(null);
+
+    // SPE-25: consume a CLOUD "done" draft through the EXACT SAME pipeline as local:
+    // sanitize -> isDraftUsable safety net -> draftLooksBroken quality gate. If broken
+    // and the quality budget remains, submit ONE fresh job as the quality regen (same
+    // accounting as local's regen); if broken again, accept + flag (like local). On a
+    // clean/usable draft, finishSuccess writes the listing and clears gen + genJob.
+    // `meta` is the worker's job meta (stopReason/continuations/elapsedMs) for diag.
+    function consumeCloudDraft(itemId, draft, meta) {
+      const item = AppStore.getItem(itemId);
+      if (!item) { delete cloudQualityRegens[itemId]; return; }   // deleted while pending
+      const clean = sanitizeDraft(draft);
+      const diag = cloudDiag(meta);
+
+      if (!isDraftUsable(clean)) {
+        delete startedAt[itemId];
+        AIListing.captureRawDebug(draft, "empty_draft", { mode: "cloud" });
+        markFailed(itemId, "The cloud returned an empty draft — tap to retry");
+        delete cloudQualityRegens[itemId];
+        return;
+      }
+
+      if (draftLooksBroken(clean)) {
+        const regens = cloudQualityRegens[itemId] || 0;
+        if (regens < MAX_QUALITY_REGENS) {
+          // Silent quality-regen: submit ONE fresh cloud job (gen stays "pending",
+          // no toast). enqueueCloud clears the old genJob + posts a new one.
+          console.warn("[GenQueue] cloud draft failed quality check — auto-regenerating once (quality regen).");
+          cloudQualityRegens[itemId] = regens + 1;
+          enqueueCloud(itemId);
+          return;
+        }
+        // Budget spent: accept the still-broken draft (never trap her) + flag it.
+        captureQualityDebug(draft, clean);
+        finishSuccess(itemId, clean, diag, regens, true);
+        delete cloudQualityRegens[itemId];
+        return;
+      }
+
+      // Clean draft — accept it.
+      finishSuccess(itemId, clean, diag, cloudQualityRegens[itemId] || 0, false);
+      delete cloudQualityRegens[itemId];
+    }
+
+    // Build a diag object (for finishSuccess -> recordSuccess) from a cloud job's
+    // meta. mode:"cloud" is stamped by finishSuccess via AIListing.mode().
+    function cloudDiag(meta) {
+      return {
+        extractionPath: "cloud",
+        formatSent: false,
+        effortSent: null,
+        stopReason: (meta && meta.stopReason) || null,
+        continuations: (meta && typeof meta.continuations === "number") ? meta.continuations : 0,
+        elapsedMs: (meta && typeof meta.elapsedMs === "number") ? meta.elapsedMs : null
+      };
+    }
+
     // SPE-24: `clean` is an ALREADY sanitized + usability-checked draft (run() did
     // that). `diag` is the API extraction diagnostics (or null for builtin/mock),
     // `qualityRegens` how many quality regenerations ran, `wasBroken` whether we're
@@ -2788,8 +3175,9 @@
       const item = AppStore.getItem(itemId);
       if (!item) return;
       // Write listing, clear gen. Status stays 'draft' — she reviews before it
-      // counts as listed (Mark as Listed lives in item detail now).
-      AppStore.updateItem(itemId, { listing: clean, gen: null });
+      // counts as listed (Mark as Listed lives in item detail now). SPE-25: also
+      // clear genJob (cloud handle is consumed) — harmless no-op for local jobs.
+      AppStore.updateItem(itemId, { listing: clean, gen: null, genJob: undefined });
       // SPE-24 fix 5: record success diagnostics alongside any lastFailure.
       try {
         AIListing.recordSuccess({
@@ -2822,7 +3210,8 @@
     function markFailed(itemId, msg) {
       delete startedAt[itemId];   // SPE-22: research over — drop the elapsed anchor
       if (!AppStore.getItem(itemId)) return;
-      AppStore.updateItem(itemId, { gen: { failed: msg } });
+      // SPE-25: clear genJob on failure so CloudPoll stops tracking a dead job.
+      AppStore.updateItem(itemId, { gen: { failed: msg }, genJob: undefined });
       const label = labelFor(AppStore.getItem(itemId));
       showGenToast("Listing failed for “" + label + "” — tap to retry", itemId);
     }
@@ -2850,7 +3239,10 @@
     // that already have a live job are skipped by hasLiveJob.
     function resumeZombies() {
       AppStore.listItems().forEach(function (it) {
-        if (it && it.gen === "pending" && !hasLiveJob(it.id)) {
+        // SPE-25: CLOUD pending items (genJob set) are NOT zombies — the server job
+        // survives; CloudPoll resumes them. Only LOCAL pending with no live job is a
+        // zombie (its in-memory fetch died while suspended).
+        if (it && it.gen === "pending" && !it.genJob && !hasLiveJob(it.id)) {
           console.warn("[GenQueue] resuming zombie pending job:", it.id);
           requeue(it.id);
         }
@@ -2862,6 +3254,10 @@
       // SPE-23:
       resumeZombies: resumeZombies, hasLiveJob: hasLiveJob, requeue: requeue,
       isTransient: isTransient,
+      // SPE-25: cloud lifecycle hooks used by CloudPoll.
+      consumeCloudDraft: consumeCloudDraft,   // done  -> sanitize/quality pipeline
+      cloudMarkFailed: markFailed,            // failed/unknown -> gen.failed + toast
+      captureCloudFailureDebug: captureCloudFailureDebug,
       __setRetryDelay: function (ms) { if (typeof ms === "number") RETRY_DELAY_MS = ms; },
       // SPE-24 fix 6 test seam: scale the backoff schedule + max retries for the
       // verification harness WITHOUT shipping shortened values. Production ships
@@ -2875,6 +3271,141 @@
         return { schedule: TRANSIENT_BACKOFF_MS.slice(), max: MAX_TRANSIENT_RETRIES, overload: OVERLOAD_BACKOFF_MS };
       }
     };
+  })();
+
+  /* ===========================================================================
+     [CLOUD POLL]  — SPE-25. Poll the Cloudflare Worker for outstanding cloud jobs.
+     ---------------------------------------------------------------------------
+     Cloud generations are submit-then-poll: GenQueue POSTs a job and persists its
+     id on item.genJob. This module drives the read side. While ANY item has a
+     genJob outstanding AND the page is visible, it polls GET /jobs every 10s in a
+     SINGLE batched request covering all outstanding ids. It also polls immediately
+     on boot and on every visibilitychange->visible (so results land the instant the
+     phone is unlocked, without waiting out the interval).
+
+     Per result:
+       done    -> GenQueue.consumeCloudDraft (existing sanitize -> draftLooksBroken
+                  pipeline; quality regen submits ONE fresh job); listing written,
+                  gen+genJob cleared, success toast.
+       failed  -> gen = { failed: worker error }, genJob cleared, failure toast.
+       unknown -> gen = { failed: "The cloud lost this job — tap Retry" }, cleared.
+     After consuming done/failed/unknown ids, batch-DELETE the done+failed ids
+     (best-effort, silent failure OK — unknown ids are already gone server-side).
+
+     CADENCE DECISIONS:
+       - 10s interval: matches the ticket + the worker's ~2s (test) / 1–3min (real)
+         job latency. Fast enough to feel responsive, slow enough to be gentle on a
+         phone battery / the worker's request budget.
+       - Single batched GET for ALL outstanding ids — never one-request-per-item.
+       - No polling while hidden (iOS freezes timers anyway); the on-visible kick
+         catches up the moment we're foregrounded.
+       - Interval is torn down when nothing is outstanding and re-armed on kick().
+     Test seam: __setInterval scales the cadence without shipping a shortened value.
+     =========================================================================== */
+  const CloudPoll = (function () {
+    let INTERVAL_MS = 10000;        // 10s batched poll cadence (shipped value)
+    let timerId = null;
+    let inFlight = false;           // guard against overlapping polls
+
+    // All item ids that currently carry a cloud job handle (gen pending + genJob).
+    function outstandingIds() {
+      return AppStore.listItems()
+        .filter(function (i) { return i && i.gen === "pending" && i.genJob; })
+        .map(function (i) { return i.genJob; });
+    }
+    // Map a returned job id back to the item that owns it (genJob === job.id).
+    function itemForJob(jobId) {
+      return AppStore.listItems().find(function (i) {
+        return i && i.gen === "pending" && i.genJob === jobId;
+      }) || null;
+    }
+
+    // One batched poll. Consumes every returned result, then best-effort DELETEs the
+    // done+failed ids. Never throws (a transient poll error just retries next tick).
+    async function pollOnce() {
+      if (inFlight) return;
+      const ids = outstandingIds();
+      if (!ids.length) { stop(); return; }
+      inFlight = true;
+      let resp;
+      try {
+        resp = await AIListing.cloudPoll(ids);
+      } catch (err) {
+        // 401 on poll = token rejected: fail every outstanding job with the Settings
+        // message (they can't be recovered without fixing the token).
+        if (err && err.kind === "http" && err.apiStatus === 401) {
+          outstandingIds().forEach(function (jobId) {
+            const it = itemForJob(jobId);
+            if (it) {
+              GenQueue.captureCloudFailureDebug(it.id, err, jobId);
+              GenQueue.cloudMarkFailed(it.id, "Cloud token rejected — check Settings");
+            }
+          });
+        }
+        // Other errors (network / 5xx): silent, retry on the next tick.
+        inFlight = false;
+        return;
+      }
+      inFlight = false;
+
+      const jobs = (resp && Array.isArray(resp.jobs)) ? resp.jobs : [];
+      const toDelete = [];   // done + failed ids to clean up server-side
+      jobs.forEach(function (job) {
+        if (!job || !job.id) return;
+        const it = itemForJob(job.id);
+        if (!it) return;     // item deleted / already resolved — nothing to do
+        if (job.status === "done") {
+          GenQueue.consumeCloudDraft(it.id, job.draft, job.meta || null);
+          toDelete.push(job.id);
+        } else if (job.status === "failed") {
+          GenQueue.captureCloudFailureDebug(it.id, { apiStatus: null, message: job.error }, job.id);
+          GenQueue.cloudMarkFailed(it.id, (job.error && String(job.error)) || "The cloud couldn't generate this listing — tap Retry");
+          toDelete.push(job.id);
+        } else if (job.status === "unknown") {
+          // Server has no record (never created, deleted, or expired). Nothing to
+          // DELETE — it's already gone. Surface a lost-job retry affordance.
+          GenQueue.cloudMarkFailed(it.id, "The cloud lost this job — tap Retry");
+        }
+        // "pending" -> leave it; poll again next tick.
+      });
+
+      // Best-effort cleanup of consumed done/failed jobs. Silent failure is fine.
+      if (toDelete.length) {
+        AIListing.cloudDelete(toDelete).catch(function () {});
+      }
+
+      // If nothing is outstanding anymore, stop the interval; else keep ticking.
+      if (!outstandingIds().length) stop();
+    }
+
+    // Start the interval if not already running (and there is work).
+    function start() {
+      if (timerId !== null) return;
+      if (!outstandingIds().length) return;
+      timerId = setInterval(function () {
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+        pollOnce();
+      }, INTERVAL_MS);
+    }
+    function stop() {
+      if (timerId !== null) { clearInterval(timerId); timerId = null; }
+    }
+
+    // Kick: immediate poll + (re)arm the interval. Called on boot, on POST success,
+    // and on visibilitychange->visible. Safe to call repeatedly.
+    function kick() {
+      if (!outstandingIds().length) { stop(); return; }
+      start();
+      // Only poll immediately when visible; a hidden kick just arms the interval.
+      if (typeof document === "undefined" || document.visibilityState !== "hidden") {
+        pollOnce();
+      }
+    }
+
+    function isPolling() { return timerId !== null; }
+    function __setInterval(ms) { if (typeof ms === "number" && ms > 0) { INTERVAL_MS = ms; if (timerId !== null) { stop(); start(); } } }
+
+    return { kick: kick, pollOnce: pollOnce, start: start, stop: stop, isPolling: isPolling, outstandingIds: outstandingIds, __setInterval: __setInterval };
   })();
 
   /* ===========================================================================
@@ -2918,6 +3449,16 @@
     });
   }
 
+  /* SPE-25 (boot path, cloud). The HEADLINE feature: cloud jobs survive the app
+     being killed. migrate() deliberately LEFT cloud pending items (gen==="pending"
+     with a genJob) untouched — no interrupted marker, no re-enqueue. On boot we
+     simply RESUME POLLING for them: CloudPoll.kick() reads item.genJob and polls
+     the worker, so an in-flight job started before the reload lands with no manual
+     retry and no interrupted state. Runs once per boot, right after load. */
+  function resumeCloudOnBoot() {
+    CloudPoll.kick();
+  }
+
   /* ===========================================================================
      [SETTINGS]  — SPE-19. Modal overlay: API key management, connection test,
      AI mode indicator, and data backup / restore.
@@ -2932,7 +3473,12 @@
     open: false,
     keyInput: "",           // working value of the key field
     feedback: null,         // { kind:'ok'|'err'|'info', msg } test/import result
-    confirmImport: null     // { data } parsed import awaiting confirmation
+    confirmImport: null,    // { data } parsed import awaiting confirmation
+    // SPE-25: cloud research working values + its own feedback line (so a cloud
+    // test result doesn't clobber an API-key test result and vice versa).
+    cloudUrlInput: "",      // working value of the worker URL field
+    cloudTokenInput: "",    // working value of the app token field
+    cloudFeedback: null     // { kind, msg } cloud save/test/clear result
   };
 
   function openSettings() {
@@ -2940,6 +3486,9 @@
     settingsState.keyInput = "";
     settingsState.feedback = null;
     settingsState.confirmImport = null;
+    settingsState.cloudUrlInput = CloudSettings.url() || "";
+    settingsState.cloudTokenInput = "";
+    settingsState.cloudFeedback = null;
     renderSettings();
   }
   function closeSettings() {
@@ -2960,11 +3509,13 @@
         '<span class="mode-indicator ' + modeKey + '"><span class="dot"></span>' +
           escapeHtml(aiModeLabel()) + '</span>' +
         '<div class="privacy-note">' +
-          (modeKey === "builtin"
-            ? "Running inside the Claude app — listings use Claude with live price research, no key needed."
-            : modeKey === "api"
-              ? "Using your Anthropic API key with web-search price research."
-              : "No AI available — the app generates clearly-labelled demo drafts. Add an API key below to enable real listings.") +
+          (modeKey === "cloud"
+            ? "Research runs on your Cloudflare Worker — jobs keep going even if you lock the phone or switch apps. Your Anthropic key lives on the worker, not here."
+            : modeKey === "builtin"
+              ? "Running inside the Claude app — listings use Claude with live price research, no key needed."
+              : modeKey === "api"
+                ? "Using your Anthropic API key with web-search price research."
+                : "No AI available — the app generates clearly-labelled demo drafts. Add an API key below to enable real listings.") +
         '</div>' +
       '</div>';
 
@@ -2992,6 +3543,43 @@
         '</div>' +
         (fb ? '<p class="settings-feedback ' + fb.kind + '">' + escapeHtml(fb.msg) + '</p>' : '') +
         '<p class="privacy-note">Your key is stored only on this device. It is never included in data exports.</p>' +
+      '</div>';
+
+    // ---- Cloud research (SPE-25) ----
+    const cloudConfigured = CloudSettings.configured();
+    const cfb = settingsState.cloudFeedback;
+    const cloudSavedRow = cloudConfigured
+      ? '<div class="key-saved-row">' +
+          '<span class="masked">' + escapeHtml(CloudSettings.url() || "") + '</span>' +
+          '<button class="btn danger-ghost tiny" type="button" data-act="clear-cloud">Clear</button>' +
+        '</div>' +
+        '<div class="key-saved-row">' +
+          '<span class="masked">Token ' + escapeHtml(CloudSettings.maskedToken()) + '</span>' +
+        '</div>'
+      : '';
+    const cloudCard =
+      '<div class="card">' +
+        '<div class="section-label">Cloud research (optional)</div>' +
+        '<p class="muted" style="margin-top:0;">Run listing research on your own Cloudflare Worker so jobs survive the phone locking or switching apps. Takes precedence over the on-device key.</p>' +
+        cloudSavedRow +
+        '<div class="field">' +
+          '<label>Worker URL</label>' +
+          '<input id="cloudUrlInput" type="url" autocomplete="off" autocapitalize="none" ' +
+            'autocorrect="off" spellcheck="false" placeholder="https://thrift-ledger-worker.…workers.dev" ' +
+            'value="' + escapeHtml(settingsState.cloudUrlInput) + '" />' +
+        '</div>' +
+        '<div class="field">' +
+          '<label>App password</label>' +
+          '<input id="cloudTokenInput" type="password" autocomplete="off" autocapitalize="none" ' +
+            'autocorrect="off" spellcheck="false" placeholder="' + (cloudConfigured ? "Replace app password" : "app token") + '" ' +
+            'style="font-size:16px;" value="' + escapeHtml(settingsState.cloudTokenInput) + '" />' +
+        '</div>' +
+        '<div class="settings-btn-row">' +
+          '<button class="btn" type="button" data-act="save-cloud">Save</button>' +
+          '<button class="btn secondary" type="button" data-act="test-cloud">Test</button>' +
+        '</div>' +
+        (cfb ? '<p class="settings-feedback ' + cfb.kind + '">' + escapeHtml(cfb.msg) + '</p>' : '') +
+        '<p class="privacy-note">The URL and app password are stored only on this device. They are never included in data exports.</p>' +
       '</div>';
 
     // ---- Backup / restore ----
@@ -3033,7 +3621,7 @@
             '<button class="modal-close" type="button" data-act="close" aria-label="Close">&times;</button>' +
           '</div>' +
           '<div class="modal-body">' +
-            modeCard + keyCard + backupCard +
+            modeCard + cloudCard + keyCard + backupCard +
             // SPE-23: version line — small + muted at the very bottom of the sheet.
             '<div class="settings-version">Version ' + escapeHtml(APP_VERSION) + '</div>' +
           '</div>' +
@@ -3069,6 +3657,16 @@
       settingsState.keyInput = keyInput.value;
     });
 
+    // SPE-25: keep the cloud fields in scratch across re-renders.
+    const cloudUrlInput = document.getElementById("cloudUrlInput");
+    if (cloudUrlInput) cloudUrlInput.addEventListener("input", function () {
+      settingsState.cloudUrlInput = cloudUrlInput.value;
+    });
+    const cloudTokenInput = document.getElementById("cloudTokenInput");
+    if (cloudTokenInput) cloudTokenInput.addEventListener("input", function () {
+      settingsState.cloudTokenInput = cloudTokenInput.value;
+    });
+
     host.querySelectorAll("[data-act]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         const act = btn.getAttribute("data-act");
@@ -3076,6 +3674,9 @@
         else if (act === "save-key") { onSaveKey(); }
         else if (act === "clear-key") { onClearKey(); }
         else if (act === "test-key") { onTestKey(btn); }
+        else if (act === "save-cloud") { onSaveCloud(); }
+        else if (act === "clear-cloud") { onClearCloud(); }
+        else if (act === "test-cloud") { onTestCloud(btn); }
         else if (act === "export") { onExportData(); }
         else if (act === "import") { triggerImportPicker(); }
         else if (act === "import-confirm") { onImportConfirm(); }
@@ -3124,13 +3725,66 @@
     else setSettingsFeedback("err", res.message || "Test failed.");
   }
 
+  /* ---------------------- Cloud research (SPE-25) ---------------------- */
+  function setCloudFeedback(kind, msg) {
+    settingsState.cloudFeedback = { kind: kind, msg: msg };
+    renderSettings();
+  }
+
+  async function onSaveCloud() {
+    const url = (settingsState.cloudUrlInput || "").trim();
+    // If configured and the token field is left blank, keep the existing token.
+    let token = (settingsState.cloudTokenInput || "").trim();
+    if (!token && CloudSettings.configured()) token = CloudSettings.token() || "";
+    const res = await CloudSettings.save(url, token);
+    if (res.ok) {
+      settingsState.cloudTokenInput = "";
+      setCloudFeedback("ok", "Cloud research saved on this device.");
+      // Mode may have flipped to "cloud" — refresh the mode label + resume polling
+      // for any outstanding cloud jobs (e.g. after fixing a token).
+      CloudPoll.kick();
+    } else {
+      setCloudFeedback("err", res.message || "Couldn't save cloud settings.");
+    }
+  }
+
+  async function onClearCloud() {
+    await CloudSettings.clear();
+    settingsState.cloudUrlInput = "";
+    settingsState.cloudTokenInput = "";
+    setCloudFeedback("info", "Cloud research cleared.");
+  }
+
+  async function onTestCloud(btn) {
+    const url = (settingsState.cloudUrlInput || "").trim() || CloudSettings.url() || "";
+    const token = (settingsState.cloudTokenInput || "").trim() || CloudSettings.token() || "";
+    settingsState.cloudFeedback = { kind: "info", msg: "Testing connection…" };
+    renderSettings();
+    const testBtn = document.querySelector('#settingsModal [data-act="test-cloud"]');
+    if (testBtn) testBtn.setAttribute("disabled", "");
+    const res = await AIListing.testCloud(url, token);
+    if (res.ok) setCloudFeedback("ok", "Connected ✓");
+    else setCloudFeedback("err", res.message || "Test failed.");
+  }
+
   /* ---------------------- Export (SPE-19 / Task 3) ---------------------- */
   function onExportData() {
-    // Serialize the full store — items + bundles + schemaVersion — NEVER the key.
+    // Serialize the full store — items + bundles + schemaVersion — NEVER the key,
+    // and NEVER the cloud URL/token (those live under their own storage keys, not in
+    // the blob). SPE-25: also strip the transient item.genJob handle from exports —
+    // it's a server-job pointer, meaningless in a backup restored elsewhere/later.
     const state = AppStore.getState();
+    const items = (state.items || []).map(function (it) {
+      if (it && "genJob" in it) {
+        const copy = Object.assign({}, it);
+        delete copy.genJob;
+        return copy;
+      }
+      return it;
+    });
     const payload = {
       schemaVersion: state.schemaVersion || SCHEMA_VERSION,
-      items: state.items || [],
+      items: items,
       bundles: state.bundles || []
     };
     let json;
@@ -5244,6 +5898,9 @@
       if (document.visibilityState === "visible") {
         WakeLock.reacquireIfWanted();
         GenQueue.resumeZombies();
+        // SPE-25: immediately poll outstanding cloud jobs on foreground so results
+        // land the instant the phone is unlocked (don't wait out the 10s interval).
+        CloudPoll.kick();
       }
     });
 
@@ -5259,6 +5916,12 @@
         AppStore: AppStore,
         resumeInterruptedOnBoot: resumeInterruptedOnBoot,
         setAiModeAvailable: __setAiModeAvailable,
+        // SPE-25: cloud research seams for the verification harness.
+        CloudPoll: CloudPoll,
+        CloudSettings: CloudSettings,
+        resumeCloudOnBoot: resumeCloudOnBoot,
+        CLOUD_URL_STORAGE: CLOUD_URL_STORAGE,
+        CLOUD_TOKEN_STORAGE: CLOUD_TOKEN_STORAGE,
         // SPE-24: pure sanitation/detection helpers exposed for in-page unit checks.
         sanitizeDraft: sanitizeDraft,
         draftLooksBroken: draftLooksBroken,
@@ -5269,11 +5932,18 @@
       };
     }
 
-    // Load persisted data + the API key (SPE-19) in parallel, then paint. The key
-    // load determines the AI mode shown in the intake/loading copy and Settings.
-    Promise.all([AppStore.load(), ApiKey.load()]).then(function () {
-      // SPE-23 feature 4 (boot path): auto-requeue jobs the app interrupted mid-
-      // research (migrate() flagged them with GEN_INTERRUPTED_MSG), once, when an
+    // Load persisted data + the API key (SPE-19) + cloud settings (SPE-25) in
+    // parallel, then paint. The key/cloud load determines the AI mode shown in the
+    // intake/loading copy and Settings, and whether cloud jobs resume.
+    Promise.all([AppStore.load(), ApiKey.load(), CloudSettings.load()]).then(function () {
+      // SPE-25 (boot path, cloud): resume POLLING any cloud job that was in flight
+      // before the app was killed (item.genJob persisted, gen still "pending"). This
+      // is the headline reload-survival feature. Must run AFTER CloudSettings.load()
+      // so the worker URL/token are available. Independent of the interrupted-marker
+      // path below (cloud pending was NEVER flagged interrupted by migrate()).
+      resumeCloudOnBoot();
+      // SPE-23 feature 4 (boot path): auto-requeue LOCAL jobs the app interrupted
+      // mid-research (migrate() flagged them with GEN_INTERRUPTED_MSG), once, when an
       // AI mode is available. Must run AFTER ApiKey.load() so "api" mode is visible.
       resumeInterruptedOnBoot();
       // SPE-23 feature 1: start the stale-build update checker (boot + on-visible).
