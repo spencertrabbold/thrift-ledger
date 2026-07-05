@@ -1056,9 +1056,21 @@
   const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
   const ANTHROPIC_VERSION = "2023-06-01";
   const ANTHROPIC_MODEL = "claude-opus-4-8";
-  // 60s: web search runs real comparable-price research server-side and is slow.
-  const API_TIMEOUT_MS = 60000;
+  // SPE-22: web-search comparable-price research on claude-opus-4-8 routinely runs
+  // 1–3 minutes. The old 60s per-request deadline killed every request mid-research.
+  //   - PER-REQUEST deadline: the AbortController budget for ONE fetch/continuation.
+  //   - OVERALL budget: a wall-clock cap across the whole pause_turn continuation
+  //     loop, so we never start a fresh 180s request once the turn has already run
+  //     long. Checked before each continuation.
+  // NOTE: these are module-level `let` (not `const`) purely so tests can monkeypatch
+  //   them to small values via the AIListing.__setTimeouts seam. SHIPPED VALUES ARE
+  //   180000 / 480000 — never ship test-scaled numbers.
+  let API_TIMEOUT_MS = 180000;          // 180s per request (was 60000)
+  let API_OVERALL_BUDGET_MS = 480000;   // 480s wall-clock across the continuation loop
   const API_MAX_CONTINUATIONS = 3;   // pause_turn server-tool-loop continuations
+  // SPE-22: research effort. "medium" meaningfully cuts research latency/cost with
+  // negligible quality impact for a resale-comps task (default is high).
+  const API_EFFORT = "medium";
 
   /* ===========================================================================
      [STORAGE]  — async key/value adapter.
@@ -1638,6 +1650,20 @@
     // Session flag: once the API rejects output_config (e.g. web_search combo),
     // stop sending it and fall back to text-scraping for the rest of the session.
     let structuredOutputsBroken = false;
+    // SPE-22: once the API rejects "effort" in output_config (400 naming it), stop
+    // sending it for the rest of the session. Independent of structuredOutputsBroken:
+    // a 400 naming "format" drops format; a 400 naming "effort" drops effort.
+    let effortBroken = false;
+
+    // SPE-22 test seam. Tests import/override the timeout constants without shipping
+    // shortened values. Not part of the production flow.
+    function __setTimeouts(perRequestMs, overallMs) {
+      if (typeof perRequestMs === "number") API_TIMEOUT_MS = perRequestMs;
+      if (typeof overallMs === "number") API_OVERALL_BUDGET_MS = overallMs;
+    }
+    function __getTimeouts() {
+      return { perRequest: API_TIMEOUT_MS, overall: API_OVERALL_BUDGET_MS };
+    }
 
     // JSON schema for the listing. NOTE (SPE-20): no numeric constraints
     // (minimum/maximum) or minLength — those are unsupported by structured
@@ -1677,13 +1703,17 @@
       return "The AI request failed (HTTP " + status + "). Try again.";
     }
 
-    // One POST to /v1/messages with a 60s timeout. `body` is the full request
-    // object. Returns the parsed JSON response, or throws an Error whose message
-    // is already user-friendly.
+    // One POST to /v1/messages with a per-request AbortController deadline
+    // (API_TIMEOUT_MS, 180s — SPE-22). `body` is the full request object. Returns
+    // the parsed JSON response, or throws an Error whose message is already
+    // user-friendly. Every thrown error is tagged with `err.kind`
+    // ("timeout" | "http" | "network") and `err.elapsedMs` so the caller can
+    // capture debug on every failure path (SPE-22).
     async function apiRequest(key, body) {
       const controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
       let timer = null;
       if (controller) timer = setTimeout(function () { controller.abort(); }, API_TIMEOUT_MS);
+      const startedAt = Date.now();
       let res;
       try {
         res = await fetch(ANTHROPIC_API_URL, {
@@ -1699,41 +1729,79 @@
         });
       } catch (e) {
         if (timer) clearTimeout(timer);
-        if (e && e.name === "AbortError") throw new Error("The AI request timed out. Try again.");
-        throw new Error("Couldn't reach Anthropic — check your connection and retry.");
+        if (e && e.name === "AbortError") {
+          // SPE-22: our own 180s deadline fired mid-research.
+          const err = new Error("Research timed out — busy network or a complex item. Tap Retry.");
+          err.kind = "timeout";
+          err.elapsedMs = Date.now() - startedAt;
+          throw err;
+        }
+        const err = new Error("Couldn't reach Anthropic — check your connection and retry.");
+        err.kind = "network";
+        err.rawMessage = (e && e.message) ? String(e.message) : String(e);
+        err.elapsedMs = Date.now() - startedAt;
+        throw err;
       }
       if (timer) clearTimeout(timer);
       if (!res.ok) {
         // Read the body so callers can inspect the error (SPE-20: detect a 400
-        // that names output_config/format so we can retry without it). We still
-        // surface a friendly message; the raw text rides along on err.apiBody.
+        // that names output_config/format/effort so we can retry without it). We
+        // still surface a friendly message; the raw text rides along on err.apiBody.
         let bodyText = "";
         try { bodyText = await res.text(); } catch (_) {}
         const err = new Error(apiErrorMessage(res.status));
+        err.kind = "http";
         err.apiStatus = res.status;
         err.apiBody = bodyText;
+        err.elapsedMs = Date.now() - startedAt;
         throw err;
       }
       try {
         return await res.json();
       } catch (e) {
-        throw new Error("The AI returned an unreadable response. Try again.");
+        const err = new Error("The AI returned an unreadable response. Try again.");
+        err.kind = "http";
+        err.apiStatus = res.status;
+        err.apiBody = "";
+        err.elapsedMs = Date.now() - startedAt;
+        throw err;
       }
     }
 
-    // SPE-20: does this failure look like the API rejecting output_config/format?
-    // (Possible interaction with the web_search tool.) If so we retry once
-    // without structured outputs and remember it for the session.
+    // SPE-20/22: does this 400 name "format" (or output_config)? If so we retry once
+    // without structured outputs and remember it for the session. SPE-22: we now
+    // inspect WHICH field the 400 names — a 400 naming "effort" is handled by
+    // isEffortError below and drops effort independently, so a format-only fallback
+    // doesn't accidentally fire on an effort 400 (and vice versa).
     function isOutputConfigError(err) {
       if (!err || err.apiStatus !== 400) return false;
       const body = (err.apiBody || "").toLowerCase();
       return body.indexOf("output_config") !== -1 || body.indexOf("format") !== -1;
     }
+    // SPE-22: does this 400 name "effort"? Drops effort for the session (independent
+    // of the structured-outputs fallback).
+    function isEffortError(err) {
+      if (!err || err.apiStatus !== 400) return false;
+      return (err.apiBody || "").toLowerCase().indexOf("effort") !== -1;
+    }
 
-    // SPE-20: persist a redacted debug snapshot of a failed/rejected generation so
+    // SPE-22: request metadata attached to EVERY debug snapshot so a failure report
+    // always says what we sent (model, web-search cap, whether effort/format rode
+    // along). Never contains the API key.
+    function requestMeta(useStructured, effortSent) {
+      return {
+        model: ANTHROPIC_MODEL,
+        maxUses: 4,                                  // web_search_20260209 max_uses
+        effortSent: effortSent || null,              // "medium" | null (dropped/skip)
+        formatSent: !!useStructured                  // did output_config.format ride along?
+      };
+    }
+
+    // SPE-20/22: persist a redacted debug snapshot of a failed/rejected generation so
     // the user can copy it back to the developer. Overwrites each time; the API
-    // key is never part of `response`, so nothing sensitive is stored.
-    function captureAiDebug(response) {
+    // key is never part of `response`/`meta`, so nothing sensitive is stored.
+    // This is the RICH parse/empty-draft path — it keeps the response content dump.
+    function captureAiDebug(response, meta) {
       try {
         const content = (response && Array.isArray(response.content)) ? response.content : [];
         const blockTypes = content.map(function (b) {
@@ -1746,39 +1814,119 @@
           .slice(0, 20000);
         const snapshot = {
           when: new Date().toISOString(),
+          kind: "parse",
           stop_reason: (response && response.stop_reason) || null,
           contentBlockTypes: blockTypes,
-          text: text
+          text: text,
+          request: meta || null
         };
         // Fire-and-forget; storage is async and failure here must not break the flow.
         Storage.set(AI_DEBUG_STORAGE, snapshot);
       } catch (_) { /* debug capture must never throw */ }
     }
 
-    // Build the request body. `useStructured` gates output_config (SPE-20).
-    function buildApiBody(messages, useStructured) {
+    // SPE-22: capture debug on EVERY non-parse failure path (timeout / http /
+    // network). `fields` carries the kind-specific data; `meta` is requestMeta().
+    // Overwrite semantics + AI_DEBUG_STORAGE key unchanged; never the API key.
+    function captureFailureDebug(fields, meta) {
+      try {
+        const snapshot = Object.assign(
+          { when: new Date().toISOString() },
+          fields || {},
+          { request: meta || null }
+        );
+        Storage.set(AI_DEBUG_STORAGE, snapshot);
+      } catch (_) { /* debug capture must never throw */ }
+    }
+
+    // Build the request body. `useStructured` gates output_config.format (SPE-20);
+    // `useEffort` gates output_config.effort (SPE-22). The two are independent —
+    // a 400 naming "format" drops format; a 400 naming "effort" drops effort — but
+    // both live inside the SAME output_config object:
+    //   output_config: { effort: "medium", format: {...} }
+    function buildApiBody(messages, useStructured, useEffort) {
       const body = {
         model: ANTHROPIC_MODEL,
         max_tokens: 8000,
         tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 4 }],
         messages: messages
       };
-      if (useStructured) body.output_config = LISTING_OUTPUT_CONFIG;
+      const oc = {};
+      if (useEffort) oc.effort = API_EFFORT;
+      if (useStructured) oc.format = LISTING_OUTPUT_CONFIG.format;
+      if (Object.keys(oc).length) body.output_config = oc;
       return body;
     }
 
     // Run the pause_turn continuation loop and return the ACCUMULATED content
     // blocks across every chunk (SPE-20 fix 3), plus the terminal response for
     // stop_reason inspection. Throws on terminal error stop_reasons.
-    async function runApiLoop(key, messages, useStructured) {
+    //
+    // SPE-22:
+    //   - Overall wall-clock budget (API_OVERALL_BUDGET_MS, 480s) across the whole
+    //     continuation loop: before each continuation request we check elapsed and,
+    //     if the budget is exhausted, fail with the existing "took too long"
+    //     message rather than starting another 180s request.
+    //   - Debug capture on EVERY failure path (timeout / http / network). apiRequest
+    //     tags each error with `kind`; here we attach `phase` ("initial" |
+    //     "continuation-N") and request metadata, then rethrow.
+    async function runApiLoop(key, messages, useStructured, useEffort) {
       // Collect ALL content blocks from every response, in order. With structured
       // outputs the draft is in the final chunk anyway, but the fallback path
       // needs earlier chunks in case the JSON landed in a pause_turn chunk.
       const accumulated = [];
       let response = null;
+      const meta = requestMeta(useStructured, useEffort ? API_EFFORT : null);
+      const loopStart = Date.now();
 
       for (let attempt = 0; attempt <= API_MAX_CONTINUATIONS; attempt++) {
-        response = await apiRequest(key, buildApiBody(messages, useStructured));
+        const phase = attempt === 0 ? "initial" : ("continuation-" + attempt);
+
+        // SPE-22: overall wall-clock budget check BEFORE each continuation request.
+        if (attempt > 0 && (Date.now() - loopStart) >= API_OVERALL_BUDGET_MS) {
+          captureFailureDebug({
+            kind: "timeout",
+            elapsedMs: Date.now() - loopStart,
+            attempt: attempt,
+            phase: phase,
+            reason: "overall-budget-exhausted"
+          }, meta);
+          throw new Error("The AI took too long researching prices. Try again.");
+        }
+
+        try {
+          response = await apiRequest(key, buildApiBody(messages, useStructured, useEffort));
+        } catch (err) {
+          // SPE-22: capture debug for timeout / http / network — the paths that
+          // previously threw before any snapshot was stored. A 400 that the caller
+          // will handle via a format/effort fallback rides through with its debug
+          // captured too (harmless — the successful retry overwrites it).
+          const kind = err && err.kind;
+          if (kind === "timeout") {
+            captureFailureDebug({
+              kind: "timeout",
+              elapsedMs: (typeof err.elapsedMs === "number") ? err.elapsedMs : null,
+              attempt: attempt,
+              phase: phase
+            }, meta);
+          } else if (kind === "http") {
+            captureFailureDebug({
+              kind: "http",
+              status: (err.apiStatus != null) ? err.apiStatus : null,
+              bodySnippet: (err.apiBody || "").slice(0, 2000),
+              attempt: attempt,
+              phase: phase
+            }, meta);
+          } else if (kind === "network") {
+            captureFailureDebug({
+              kind: "network",
+              message: err.rawMessage || err.message || "network error",
+              attempt: attempt,
+              phase: phase
+            }, meta);
+          }
+          throw err;
+        }
 
         if (response && Array.isArray(response.content)) {
           for (let i = 0; i < response.content.length; i++) accumulated.push(response.content[i]);
@@ -1788,6 +1936,13 @@
         if (stop === "pause_turn") {
           // Server tool loop paused — re-send with the assistant content appended.
           if (attempt >= API_MAX_CONTINUATIONS) {
+            captureFailureDebug({
+              kind: "timeout",
+              elapsedMs: Date.now() - loopStart,
+              attempt: attempt,
+              phase: phase,
+              reason: "max-continuations"
+            }, meta);
             throw new Error("The AI took too long researching prices. Try again.");
           }
           messages.push({ role: "assistant", content: response.content });
@@ -1811,7 +1966,8 @@
       return {
         stop_reason: response.stop_reason,
         content: accumulated,
-        _terminal: response
+        _terminal: response,
+        _meta: meta
       };
     }
 
@@ -1819,19 +1975,38 @@
       const key = ApiKey.get();
       if (!key) throw new Error("No API key configured. Add one in Settings.");
 
+      // A fresh prompt each attempt (runApiLoop mutates its messages array with
+      // pause_turn continuations, so we can't reuse the same array across retries).
+      function freshMessages() {
+        return [{ role: "user", content: buildPrompt(payload, true) }];
+      }
+
       // Structured outputs guarantee the final text block is the listing JSON —
-      // unless we've already learned this session that the API rejects it.
-      const useStructured = !structuredOutputsBroken;
+      // unless we've already learned this session that the API rejects it (SPE-20).
+      // Effort (SPE-22) is gated independently by effortBroken.
+      let useStructured = !structuredOutputsBroken;
+      let useEffort = !effortBroken;
       let result;
-      try {
-        result = await runApiLoop(key, [{ role: "user", content: buildPrompt(payload, true) }], useStructured);
-      } catch (err) {
-        if (useStructured && isOutputConfigError(err)) {
-          // Structured outputs + web_search interaction failed. Remember it for
-          // the session and retry ONCE without output_config (graceful degrade).
-          structuredOutputsBroken = true;
-          result = await runApiLoop(key, [{ role: "user", content: buildPrompt(payload, true) }], false);
-        } else {
+      // Up to two fallbacks may be needed (one for effort, one for format), so
+      // loop a bounded number of times, dropping whichever field a 400 names.
+      for (let tries = 0; ; tries++) {
+        try {
+          result = await runApiLoop(key, freshMessages(), useStructured, useEffort);
+          break;
+        } catch (err) {
+          // SPE-22: inspect WHICH field a 400 names and drop only that one, setting
+          // the matching session flag so later generations skip it. The two flags
+          // are independent.
+          if (tries < 2 && useEffort && isEffortError(err)) {
+            effortBroken = true;
+            useEffort = false;
+            continue;
+          }
+          if (tries < 2 && useStructured && isOutputConfigError(err)) {
+            structuredOutputsBroken = true;
+            useStructured = false;
+            continue;
+          }
           throw err;
         }
       }
@@ -1839,9 +2014,10 @@
       try {
         return parseResponse(result.content);
       } catch (parseErr) {
-        // Couldn't extract a listing from the accumulated text — snapshot for the
-        // user to report, then rethrow so the UI shows the error/retry step.
-        captureAiDebug(result);
+        // Couldn't extract a listing from the accumulated text — snapshot (rich,
+        // with request metadata) for the user to report, then rethrow so the UI
+        // shows the error/retry step.
+        captureAiDebug(result, result && result._meta);
         throw parseErr;
       }
     }
@@ -1918,6 +2094,7 @@
         try {
           Storage.set(AI_DEBUG_STORAGE, {
             when: new Date().toISOString(),
+            kind: "empty_draft",
             stop_reason: stopReason || null,
             contentBlockTypes: [],
             text: (function () {
@@ -1926,7 +2103,14 @@
             })()
           });
         } catch (_) { /* never throw */ }
-      }
+      },
+      // SPE-22 test seam: exposed so the verification harness can drive the direct-
+      // API path (generateApi/buildApiBody) and monkeypatch the timeout constants
+      // WITHOUT shipping shortened values. Not used by the production flow.
+      generateApi: generateApi,
+      buildApiBody: buildApiBody,
+      __setTimeouts: __setTimeouts,
+      __getTimeouts: __getTimeouts
     };
   })();
 
@@ -1972,6 +2156,11 @@
     const MAX_CONCURRENT = 2;
     const active = new Set();   // item ids currently generating (in flight)
     const queue = [];           // item ids waiting for a slot (FIFO)
+    // SPE-22: when each pending item was enqueued, so the item-detail research panel
+    // can show an elapsed timer. Best-effort/in-memory only (like `active`/`queue`);
+    // after a reboot mid-research migrate() flips "pending" to failed, so a missing
+    // entry just means the panel falls back to item.createdAt.
+    const startedAt = Object.create(null);
 
     // Count of items the store considers pending. Durable truth, not the in-memory
     // sets — so a re-render or reboot-normalized state stays accurate.
@@ -2007,10 +2196,20 @@
     function enqueue(itemId) {
       const item = AppStore.getItem(itemId);
       if (!item) return;
+      startedAt[itemId] = Date.now();                  // SPE-22: elapsed-timer anchor
       AppStore.updateItem(itemId, { gen: "pending" }); // durable pending -> notify re-renders badges
       if (active.has(itemId) || queue.indexOf(itemId) !== -1) return; // already scheduled
       queue.push(itemId);
       pump();
+    }
+
+    // SPE-22: epoch ms this item's current research started (for the elapsed timer).
+    // Falls back to the item's createdAt if we have no in-memory anchor (e.g. after
+    // a reboot that left an orphaned pending — though migrate() normally clears it).
+    function startedAtFor(itemId) {
+      if (startedAt[itemId]) return startedAt[itemId];
+      const it = AppStore.getItem(itemId);
+      return (it && it.createdAt) ? it.createdAt : Date.now();
     }
 
     // Start as many queued jobs as the concurrency cap allows.
@@ -2043,6 +2242,7 @@
     }
 
     function finishSuccess(itemId, draft) {
+      delete startedAt[itemId];   // SPE-22: research done — drop the elapsed anchor
       // Discard if the item was deleted while research ran.
       const item = AppStore.getItem(itemId);
       if (!item) return;
@@ -2073,13 +2273,14 @@
     // happened inside generateApi for API parse failures; empty-draft capture
     // happens in finishSuccess.)
     function markFailed(itemId, msg) {
+      delete startedAt[itemId];   // SPE-22: research over — drop the elapsed anchor
       if (!AppStore.getItem(itemId)) return;
       AppStore.updateItem(itemId, { gen: { failed: msg } });
       const label = labelFor(AppStore.getItem(itemId));
       showGenToast("Listing failed for “" + label + "” — tap to retry", itemId);
     }
 
-    return { enqueue: enqueue, pendingCount: pendingCount };
+    return { enqueue: enqueue, pendingCount: pendingCount, startedAtFor: startedAtFor };
   })();
 
   /* ===========================================================================
@@ -3025,6 +3226,13 @@
     const el = document.getElementById("inventoryList");
     if (!el) return;
 
+    // SPE-22: the whole #inventoryList is about to be rebuilt, tearing down any
+    // research-panel span. Kill the elapsed-timer interval up front; if the new
+    // render is a pending detail, wireInventoryDetail() starts a fresh one. This
+    // single choke point guarantees at most one live interval across every path
+    // (detail↔list, tab switch, item deleted, gen resolved).
+    stopResearchTimer();
+
     // Bundle success moment (SPE-13) takes over the whole list view briefly.
     if (invState.bundleDone) {
       el.innerHTML = bundleDoneHTML();
@@ -3471,6 +3679,10 @@
           '<div class="research-panel">' +
             '<div class="research-orbit"><span class="research-dot"></span></div>' +
             '<div style="font-weight:650;color:var(--ink);">&#128269; Researching prices&hellip;</div>' +
+            // SPE-22: elapsed indicator — ticks via a 1s interval wired in
+            // wireInventoryDetail; span filled by startResearchTimer().
+            '<div class="muted" style="margin-top:6px;">Researching for ' +
+              '<span id="researchElapsed">0s</span> — typically takes 1–3 minutes</div>' +
             '<div class="muted" style="margin-top:6px;">Searching Poshmark, eBay, Mercari &amp; Depop for comparables. ' +
               'You can keep adding items — the listing will land here when it’s ready.</div>' +
           '</div>' +
@@ -3679,6 +3891,12 @@
     const el = document.getElementById("inventoryList");
     if (!el) return;
     const id = item.id;
+
+    // SPE-22: research in progress — start the 1s elapsed ticker for this item.
+    // renderInventory() already stopped any prior interval, so this is the sole
+    // owner. If gen isn't pending, no timer is started (and the choke-point stop
+    // in renderInventory left us with none).
+    if (item.gen === "pending") startResearchTimer(id);
 
     const back = document.getElementById("detailBackBtn");
     if (back) back.addEventListener("click", function () {
@@ -3890,6 +4108,43 @@
     try { return fn(); } finally { suppressInvRerender = false; }
   }
 
+  /* ---------------------------------------------------------------------------
+     SPE-22: elapsed-time indicator for the item-detail research panel.
+     ---------------------------------------------------------------------------
+     The detail view is destroyed + rebuilt on EVERY store notify (renderInventory
+     rewrites #inventoryList.innerHTML), so a naive setInterval would leak one timer
+     per re-render. We keep a SINGLE owned handle here. stopResearchTimer() clears it;
+     startResearchTimer() always stops the prior one first (idempotent), so no matter
+     how often the detail re-renders or the user navigates away/back, at most one
+     interval is ever live. Boot exposes window.__researchTimerActive() for the test
+     harness to assert zero leaks after repeated navigation.
+     --------------------------------------------------------------------------- */
+  let researchTimerId = null;
+  function stopResearchTimer() {
+    if (researchTimerId !== null) { clearInterval(researchTimerId); researchTimerId = null; }
+  }
+  // Human "1m 20s" from a start epoch. Clamped at 0.
+  function formatElapsed(startMs) {
+    let secs = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return m > 0 ? (m + "m " + s + "s") : (s + "s");
+  }
+  // Start (or restart) the 1s ticker for the given item's research panel. Writes
+  // into the #researchElapsed span if it's present; if the span disappears (panel
+  // gone) the tick self-clears so a stale interval never lingers.
+  function startResearchTimer(itemId) {
+    stopResearchTimer();                       // never stack intervals
+    const startMs = GenQueue.startedAtFor(itemId);
+    function paint() {
+      const span = document.getElementById("researchElapsed");
+      if (!span) { stopResearchTimer(); return; }   // panel unmounted — stop cleanly
+      span.textContent = formatElapsed(startMs);
+    }
+    paint();                                   // immediate, no 1s blank
+    researchTimerId = setInterval(paint, 1000);
+  }
+
   /* ===========================================================================
      [DASHBOARD]  — SPE-14. Spend / revenue / fees / net profit + recent sales.
      All figures come from Sales.summary() / Sales.recentSales() (invariants I1-I5).
@@ -4082,9 +4337,9 @@
     // transient DOM state (focus, in-progress edits). Suppress store-driven
     // re-renders of it while a flow handler is mid-transition, so an intake
     // mutation's notify() doesn't clobber the form. Other tabs always re-render.
-    if (tab === "add") { if (!suppressAddRerender) renderAdd(); }
+    if (tab === "add") { stopResearchTimer(); if (!suppressAddRerender) renderAdd(); }
     else if (tab === "inventory") { if (!suppressInvRerender) renderInventory(); }
-    else if (tab === "dashboard") renderDashboard();
+    else if (tab === "dashboard") { stopResearchTimer(); renderDashboard(); }
     renderGenPill(); // SPE-21: keep the "N researching" pill in sync on every change
   }
 
@@ -4167,6 +4422,13 @@
     // Surface storage problems (quota / corruption) as a small non-blocking banner
     // instead of only console — Alissa's on a phone with no console open (SPE-15).
     Storage.onWarn(showStorageWarning);
+
+    // SPE-22 test hook: lets the verification harness assert the research-panel
+    // elapsed timer leaves no interval leaks after navigating away/back. Returns
+    // true iff exactly one elapsed-timer interval is currently live.
+    if (typeof window !== "undefined") {
+      window.__researchTimerActive = function () { return researchTimerId !== null; };
+    }
 
     // Views re-render on any store change.
     AppStore.subscribe(function () { renderActive(); });
