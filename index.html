@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- app-version: 2026-07-05.3 -->
+<!-- app-version: 2026-07-05.4 -->
 <!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
      constant (search for `const APP_VERSION =`) MUST stay identical. The
      orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
@@ -1071,14 +1071,14 @@
      [APP VERSION]  — SPE-23. Single source of truth for the deployed build id.
      ---------------------------------------------------------------------------
      THIS CONSTANT AND THE HTML MARKER COMMENT NEAR THE TOP OF THE FILE
-     (`<!-- app-version: 2026-07-05.2 -->`) MUST STAY IDENTICAL. The orchestrator
+     (`<!-- app-version: ... -->`) MUST STAY IDENTICAL. The orchestrator
      bumps BOTH on every deploy. UpdateCheck fetches the live page, reads the
      marker, and compares it to this constant to detect a stale cached build (the
      root cause of SPE-23: iOS served an old cached build whose pre-SPE-22 error
      copy proved the page was stale). appVersion is also stamped into every AI
      debug snapshot so failure reports say which build produced them.
      =========================================================================== */
-  const APP_VERSION = "2026-07-05.3";
+  const APP_VERSION = "2026-07-05.4";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -1150,7 +1150,9 @@
   const AI_DEBUG_STORAGE = "thrift-ledger:lastai-debug";
   const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
   const ANTHROPIC_VERSION = "2023-06-01";
-  const ANTHROPIC_MODEL = "claude-opus-4-8";
+  // Sonnet 5 (SPE-26): near-Opus quality for comps research at ~2x speed and
+  // lower congestion. Revert to "claude-opus-4-8" if listing quality drops.
+  const ANTHROPIC_MODEL = "claude-sonnet-5";
   // SPE-22: web-search comparable-price research on claude-opus-4-8 routinely runs
   // 1–3 minutes. The old 60s per-request deadline killed every request mid-research.
   //   - PER-REQUEST deadline: the AbortController budget for ONE fetch/continuation.
@@ -2627,7 +2629,7 @@
     let fetchImpl = (typeof fetch !== "undefined") ? fetch.bind(window) : null;
 
     // Pull the app-version marker out of fetched page text. Same token the HTML
-    // marker uses: `app-version: 2026-07-05.2`.
+    // marker uses (`app-version: <YYYY-MM-DD.N>`).
     function parseVersion(text) {
       if (typeof text !== "string") return null;
       const m = text.match(/app-version:\s*([\w.\-]+)/);

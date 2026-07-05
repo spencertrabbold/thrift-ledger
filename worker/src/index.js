@@ -291,12 +291,14 @@ function publicView(record) {
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
-const ANTHROPIC_MODEL = "claude-opus-4-8";
+// Sonnet 5: near-Opus quality for comps research at ~2x speed and lower
+// congestion (SPE-26). Revert to "claude-opus-4-8" if listing quality drops.
+const ANTHROPIC_MODEL = "claude-sonnet-5";
 const API_EFFORT = "medium";
 const API_MAX_CONTINUATIONS = 3; // pause_turn continuations
-const PER_JOB_BUDGET_MS = 8 * 60 * 1000; // ~8 min overall per-job budget
-const UPSTREAM_MAX_RETRIES = 2; // 529/5xx/network: retry twice
-const BACKOFFS_MS = [10000, 30000]; // 10s, then 30s
+const PER_JOB_BUDGET_MS = 10 * 60 * 1000; // ~10 min overall per-job budget (alarm cap is 15)
+const UPSTREAM_MAX_RETRIES = 3; // 529/5xx/network: server-side, we can afford patience
+const BACKOFFS_MS = [15000, 45000, 90000]; // 15s, 45s, 90s
 
 const PLATFORMS = ["poshmark", "ebay", "mercari", "depop"];
 const CONDITION_LABELS = {
@@ -389,7 +391,7 @@ function buildApiBody(messages) {
   return {
     model: ANTHROPIC_MODEL,
     max_tokens: 8000,
-    tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 4 }],
+    tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 3 }],
     output_config: { effort: API_EFFORT, format: LISTING_FORMAT },
     messages,
   };
@@ -397,14 +399,14 @@ function buildApiBody(messages) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// One POST to /v1/messages. Retries 529/5xx/network twice with 10s/30s backoff
-// (staying inside the per-job budget). Throws a friendly Error on terminal
-// failure. NO anthropic-dangerous-direct-browser-access header (server-side).
+// One POST to /v1/messages. Retries 529/5xx/network per UPSTREAM_MAX_RETRIES
+// with BACKOFFS_MS backoff (staying inside the per-job budget). Throws a
+// friendly Error on terminal failure. NO browser-access header (server-side).
 async function apiRequest(env, body, startedAt) {
   let lastErr = null;
   for (let attempt = 0; attempt <= UPSTREAM_MAX_RETRIES; attempt++) {
     if (attempt > 0) {
-      const backoff = BACKOFFS_MS[attempt - 1] || 30000;
+      const backoff = BACKOFFS_MS[attempt - 1] || BACKOFFS_MS[BACKOFFS_MS.length - 1];
       if (Date.now() - startedAt + backoff > PER_JOB_BUDGET_MS) {
         throw fail("The AI took too long researching prices. Try again.");
       }
