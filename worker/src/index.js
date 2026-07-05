@@ -308,6 +308,20 @@ const CONDITION_LABELS = {
   Fair: "Fair",
 };
 
+// SPE-30 — Department. Additive optional payload field; drives pronouns/style/
+// sizing + the eBay title keyword in the generated copy. Default "women" when
+// absent (old app clients that predate the field). Kept byte-identical to the
+// app's DEPARTMENT_LABELS + prompt lines (see index.html buildPrompt).
+const DEPARTMENT_LABELS = {
+  women: "Women's",
+  men: "Men's",
+  unisex: "Unisex",
+  kids: "Kids'",
+};
+function normalizeDepartment(d) {
+  return DEPARTMENT_LABELS.hasOwnProperty(d) ? d : "women";
+}
+
 // JSON schema — mirrors LISTING_OUTPUT_CONFIG.format in index.html EXACTLY.
 // No numeric/length constraints (unsupported by structured outputs; would 400).
 const LISTING_FORMAT = {
@@ -339,6 +353,8 @@ function itemDescriptor(payload) {
   const parts = [];
   if (payload.brand) parts.push("Brand: " + payload.brand);
   if (payload.category) parts.push("Category/type: " + payload.category);
+  // SPE-30: department drives pronouns/style/sizing + the eBay title keyword.
+  parts.push("Department: " + DEPARTMENT_LABELS[normalizeDepartment(payload.department)]);
   if (payload.size) parts.push("Size: " + payload.size);
   if (payload.condition)
     parts.push("Condition: " + (CONDITION_LABELS[payload.condition] || payload.condition));
@@ -361,6 +377,7 @@ function buildPrompt(payload) {
     "",
     "ITEM DETAILS:",
     itemDescriptor(payload),
+    "Write all listing text for this department (pronouns, style words, sizing conventions). Include the department word in the eBay title keywords (e.g. \"Women's\").",
     "",
     "TASK:",
     priceTask,
@@ -617,10 +634,14 @@ function mockDraft(payload) {
   const condLabel = CONDITION_LABELS[payload.condition] || payload.condition || "Good";
   const cost = Number(payload.costPaid) || 0;
   const price = Math.max(12, Math.round(cost * 3)) - 0.01;
+  // SPE-30: surface the department in the canned draft so an end-to-end TEST_MODE
+  // POST->GET visibly carries the field through (the real prompt can't be asserted
+  // in TEST_MODE — this proves the payload plumbing).
+  const deptLabel = DEPARTMENT_LABELS[normalizeDepartment(payload.department)];
   return {
-    title: brand + " " + cat + " Size " + size + " " + condLabel,
+    title: brand + " " + deptLabel + " " + cat + " Size " + size + " " + condLabel,
     description:
-      "[TEST DRAFT] " + condLabel + " " + brand + " " + cat + " in size " + size +
+      "[TEST DRAFT] " + condLabel + " " + deptLabel + " " + brand + " " + cat + " in size " + size +
       ". Great secondhand find, pictured as-is. Smoke-free. Bundle to save on shipping!",
     suggestedPrice: price,
     platforms: {

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- app-version: 2026-07-05.7 -->
+<!-- app-version: 2026-07-05.8 -->
 <!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
      constant (search for `const APP_VERSION =`) MUST stay identical. The
      orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
@@ -62,15 +62,18 @@
       line-height: 1.45;
       -webkit-font-smoothing: antialiased;
       overscroll-behavior-y: none;
-      /* SPE-27 fix 1: kill horizontal pan/rubber-banding on iOS. The layout is
-         phone-shaped (#app max-width 640, centered) and all content is fixed to
-         100%/relative widths, so nothing SHOULD overflow — but a stray wide child
-         (a very long unbroken listing string, or the centered gen toast) could
-         still let the whole page be swiped left-right, shoving the UI off-center.
-         Clamp X here as defense-in-depth AND stop horizontal overscroll so the
-         page can never be panned; per-container overflow-x:auto (filter chips)
-         still works because it's scoped to that element, not the document. */
-      overflow-x: hidden;
+      /* SPE-27 fix 1 / SPE-30 hardening: kill horizontal pan/rubber-banding on iOS.
+         The layout is phone-shaped (#app max-width 640, centered) and all content is
+         fixed to 100%/relative widths, so nothing SHOULD overflow — but a stray wide
+         child (a very long unbroken listing string, the centered gen toast, a fixed
+         pill/banner, a mid-drag swipe row) could still let the whole page be swiped
+         left-right, shoving the sticky header off-center (the SPE-30 screenshot bug).
+         SPE-30: `overflow-x: clip` is stronger than `hidden` — `hidden` establishes a
+         scroll CONTAINER (so a sticky/fixed descendant can still be scrolled within it
+         and iOS momentum can leak), whereas `clip` hard-clips WITHOUT a scroll port, so
+         there is nothing to pan. Keep overscroll-behavior-x:none as a belt. Per-element
+         overflow-x:auto (filter chips) still works — it's scoped to that element. */
+      overflow-x: clip;
       overscroll-behavior-x: none;
     }
 
@@ -213,6 +216,40 @@
 
     .row { display: flex; gap: 12px; }
     .row > * { flex: 1; }
+
+    /* SPE-30 — Department segmented control (intake). A single flush row of equal
+       segments; the active one fills accent. Text >=16px (no iOS zoom-on-focus is
+       irrelevant here since these are buttons, but keeps the touch target honest).
+       max-width:100% + the parent .field width:100% keep it inside the 390px column. */
+    .seg {
+      display: flex;
+      width: 100%;
+      max-width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--surface);
+    }
+    .seg button {
+      flex: 1 1 0;
+      min-width: 0;                 /* let segments shrink instead of overflowing */
+      font: inherit; font-size: 16px; font-weight: 600;
+      padding: 10px 4px;
+      border: none;
+      border-left: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink-soft);
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .seg button:first-child { border-left: none; }
+    .seg button:active { filter: brightness(.96); }
+    .seg button.active {
+      background: var(--accent);
+      color: var(--accent-ink);
+    }
 
     /* =========================================================================
        PHASE 2 (SPE-6..9) — intake / generation / review UI
@@ -1076,6 +1113,14 @@
                                  //   Compression handled in SPE-6. Nullable so a
                                  //   record can exist before/without a photo.
        category:  string,   // free text, e.g. "Dress"
+       department:'women' | 'men' | 'unisex' | 'kids',
+                            //   SPE-30: which department the item belongs to. Drives
+                            //   pronouns / style words / sizing conventions in the
+                            //   generated copy AND the eBay title keyword (e.g.
+                            //   "Women's"). Additive + optional: defaults to "women"
+                            //   via makeItem(); migrate() backfills a missing value to
+                            //   "women" (old items predate the field). No SCHEMA_VERSION
+                            //   bump — additive field. Exported/imported round-trips.
        brand:     string,   // free text, e.g. "Zara"  ("" if unknown)
        size:      string,   // free text, e.g. "M"
        condition: string,   // free text enum-ish, e.g. "Like new"
@@ -1192,7 +1237,7 @@
      copy proved the page was stale). appVersion is also stamped into every AI
      debug snapshot so failure reports say which build produced them.
      =========================================================================== */
-  const APP_VERSION = "2026-07-05.7";
+  const APP_VERSION = "2026-07-05.8";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -1262,6 +1307,33 @@
     "Good": "Good",
     "Fair": "Fair"
   });
+
+  /* SPE-30 — Department. Drives the pronouns/style/sizing/eB­ay-keyword language in
+     the generated copy (fixes the real bug where the AI wrote "men's" all over a
+     women's-shorts listing). Additive optional Item field; default "women". */
+  const DEPARTMENT_OPTIONS = Object.freeze(["women", "men", "unisex", "kids"]);
+  // How each department reads in the intake control AND the generated copy.
+  const DEPARTMENT_LABELS = Object.freeze({
+    women:  "Women's",
+    men:    "Men's",
+    unisex: "Unisex",
+    kids:   "Kids'"
+  });
+  function validDepartment(d) { return DEPARTMENT_OPTIONS.indexOf(d) !== -1; }
+  function normalizeDepartment(d) { return validDepartment(d) ? d : "women"; }
+  // Categories that unambiguously imply a department. Only OBVIOUSLY-gendered ones
+  // auto-adjust the picker (before the user manually touches it). Keyed by the exact
+  // CATEGORY_OPTIONS value. (No men-obvious categories in the current list.)
+  const CATEGORY_DEPARTMENT = Object.freeze({
+    "Dress": "women",
+    "Skirt": "women",
+    "Top / Blouse": "women",
+    "Jumpsuit / Romper": "women"
+  });
+  // Session default (in-memory only, NOT persisted across reloads — mirrors the
+  // lightweight addState scratch pattern). Starts "women"; a manual pick in the
+  // intake control updates it so subsequent new items inherit that choice.
+  let sessionDepartment = "women";
 
   // Photo compression params (SPE-6). Longest edge cap + JPEG quality.
   const PHOTO_MAX_EDGE = 800;
@@ -1610,6 +1682,7 @@
         createdAt: Date.now(),
         photo: null,
         category: "",
+        department: "women",   // SPE-30: additive optional; default women.
         brand: "",
         size: "",
         condition: "",
@@ -1670,6 +1743,10 @@
         if (it && it.gen === "pending" && !it.genJob) {
           it.gen = { failed: GEN_INTERRUPTED_MSG };
         }
+        // SPE-30: backfill the additive department field. Items created before
+        // SPE-30 (and imported backups lacking it) default to "women"; a present-
+        // but-invalid value is also normalized.
+        if (it && !validDepartment(it.department)) it.department = "women";
       });
       // (future) if (blob.schemaVersion < 2) { ...transform... }
       blob.schemaVersion = SCHEMA_VERSION;
@@ -1877,6 +1954,8 @@
       const parts = [];
       if (payload.brand) parts.push("Brand: " + payload.brand);
       if (payload.category) parts.push("Category/type: " + payload.category);
+      // SPE-30: department drives pronouns/style/sizing + the eBay title keyword.
+      parts.push("Department: " + (DEPARTMENT_LABELS[normalizeDepartment(payload.department)]));
       if (payload.size) parts.push("Size: " + payload.size);
       if (payload.condition) parts.push("Condition: " + (CONDITION_LABELS[payload.condition] || payload.condition));
       parts.push("Seller paid: $" + (Number(payload.costPaid) || 0).toFixed(2) + " to acquire it");
@@ -1901,6 +1980,7 @@
         "",
         "ITEM DETAILS:",
         itemDescriptor(payload),
+        "Write all listing text for this department (pronouns, style words, sizing conventions). Include the department word in the eBay title keywords (e.g. \"Women's\").",
         "",
         "TASK:",
         priceTask,
@@ -2589,6 +2669,7 @@
       return {
         brand: payload.brand || "",
         category: payload.category || "",
+        department: normalizeDepartment(payload.department),   // SPE-30
         size: payload.size || "",
         condition: payload.condition || "",
         costPaid: Number(payload.costPaid) || 0,
@@ -4407,7 +4488,14 @@
   };
 
   function freshForm() {
-    return { photo: null, category: "", categoryOther: "", brand: "", size: "", condition: "", costPaid: "" };
+    // SPE-30: department seeds from the in-memory session default (starts "women").
+    // departmentTouched gates the category auto-adjust: once the user manually picks
+    // a department for THIS form instance, category changes stop overriding it.
+    return {
+      photo: null, category: "", categoryOther: "",
+      department: normalizeDepartment(sessionDepartment), departmentTouched: false,
+      brand: "", size: "", condition: "", costPaid: ""
+    };
   }
 
   function renderAdd() {
@@ -4455,6 +4543,14 @@
         return '<option value="' + escapeHtml(c) + '"' + (f.condition === c ? " selected" : "") + '>' + escapeHtml(label) + '</option>';
       })).join("");
 
+    // SPE-30: department segmented control. Active = current form department.
+    const curDept = normalizeDepartment(f.department);
+    const deptSeg = DEPARTMENT_OPTIONS.map(function (d) {
+      return '<button type="button" class="seg-btn' + (d === curDept ? " active" : "") +
+        '" data-dept="' + escapeHtml(d) + '" aria-pressed="' + (d === curDept ? "true" : "false") + '">' +
+        escapeHtml(DEPARTMENT_LABELS[d]) + '</button>';
+    }).join("");
+
     return '' +
       '<div class="card">' +
         '<h2>New Item</h2>' +
@@ -4475,6 +4571,10 @@
           ? '<div class="field"><label>Category (custom)</label>' +
             '<input id="f-category-other" value="' + escapeHtml(f.categoryOther) + '" placeholder="e.g. Scarf" /></div>'
           : "") +
+        '<div class="field">' +
+          '<label>Department</label>' +
+          '<div class="seg" id="f-department" role="group" aria-label="Department">' + deptSeg + '</div>' +
+        '</div>' +
         '<div class="field' + (err && err.field === "brand" ? " invalid" : "") + '">' +
           '<label>Brand</label>' +
           '<input id="f-brand" value="' + escapeHtml(f.brand) + '" placeholder="e.g. Zara" />' +
@@ -4553,7 +4653,28 @@
       const cat = document.getElementById("f-category");
       if (cat) cat.addEventListener("change", function () {
         addState.form.category = cat.value;
-        renderAdd(); // re-render to show/hide the custom field
+        // SPE-30: auto-adjust department for obviously-gendered categories, but ONLY
+        // until the user manually touches the department control this form instance.
+        // Manual selection wins: once departmentTouched, category never overrides.
+        if (!addState.form.departmentTouched) {
+          var auto = CATEGORY_DEPARTMENT[cat.value];
+          if (auto) addState.form.department = auto;
+        }
+        renderAdd(); // re-render to show/hide the custom field + reflect department
+      });
+
+      // SPE-30: department segmented control. A manual pick sets the value, marks
+      // the form as touched (freezing auto-adjust), and updates the in-memory
+      // session default so the NEXT new item inherits this choice.
+      var deptGroup = document.getElementById("f-department");
+      if (deptGroup) deptGroup.addEventListener("click", function (e) {
+        var btn = e.target.closest("[data-dept]");
+        if (!btn) return;
+        var d = normalizeDepartment(btn.getAttribute("data-dept"));
+        addState.form.department = d;
+        addState.form.departmentTouched = true;
+        sessionDepartment = d;
+        renderAdd();
       });
       const cond = document.getElementById("f-condition");
       if (cond) cond.addEventListener("change", function () { addState.form.condition = cond.value; });
@@ -4634,6 +4755,7 @@
       payload: {
         photo: f.photo || null,
         category: category,
+        department: normalizeDepartment(f.department),   // SPE-30
         brand: brand,
         size: (f.size || "").trim(),
         condition: f.condition || "",
@@ -5691,6 +5813,7 @@
       ["Status", statusLabel(i.status)],
       ["Brand", i.brand || "—"],
       ["Category", i.category || "—"],
+      ["Department", DEPARTMENT_LABELS[normalizeDepartment(i.department)]],   // SPE-30
       ["Size", i.size || "—"],
       ["Condition", i.condition ? (CONDITION_LABELS[i.condition] || i.condition) : "—"],
       ["Cost paid", money(i.costPaid)]
@@ -5723,8 +5846,8 @@
     fields.push.apply(fields, soldRows.map(function (r) { return [r[0], r[1]]; }));
 
     const kv = fields.map(function (f, idx) {
-      // fields beyond the base 6 are sold rows; carry their value class if any.
-      const soldIdx = idx - 6;
+      // fields beyond the base 7 are sold rows; carry their value class if any.
+      const soldIdx = idx - 7;
       const cls = (soldIdx >= 0 && soldRows[soldIdx] && soldRows[soldIdx][2]) ? " " + soldRows[soldIdx][2] : "";
       return '<div class="kv-row"><span class="k">' + escapeHtml(f[0]) + '</span>' +
         '<span class="v' + cls + '">' + escapeHtml(f[1]) + '</span></div>';
