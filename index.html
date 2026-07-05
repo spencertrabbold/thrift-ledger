@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- app-version: 2026-07-05.6 -->
+<!-- app-version: 2026-07-05.7 -->
 <!-- SPE-23 SINGLE SOURCE OF TRUTH: this marker comment and the `APP_VERSION` JS
      constant (search for `const APP_VERSION =`) MUST stay identical. The
      orchestrator bumps BOTH LOAD-BEARING lines on every deploy: (1) the
@@ -868,7 +868,7 @@
        A persistent, tappable pill in the same fixed slot family as #genPill. When
        both are visible they STACK: the gen pill sits at the base slot and the
        update banner floats just above it (see #updateBanner.with-gen-pill). Never
-       auto-reloads — only a tap calls location.reload().
+       auto-refreshes — only a tap navigates to a cache-busted URL.
        ========================================================================= */
     #updateBanner {
       position: fixed;
@@ -1034,7 +1034,8 @@
   </button>
 
   <!-- SPE-23: persistent "Update available" banner. Fixed above the tab bar; shown
-       only when UpdateCheck detects a newer deployed build; tapping reloads. Stacks
+       only when UpdateCheck detects a newer deployed build; tapping navigates to a
+       cache-busted URL (iOS serves plain reload() from stale cache). Stacks
        above #genPill when both are visible. -->
   <button id="updateBanner" type="button" aria-label="A new version is available — tap to refresh">
     <span class="ub-ico">&#8635;</span><span>Update available — tap to refresh</span>
@@ -1191,7 +1192,7 @@
      copy proved the page was stale). appVersion is also stamped into every AI
      debug snapshot so failure reports say which build produced them.
      =========================================================================== */
-  const APP_VERSION = "2026-07-05.6";
+  const APP_VERSION = "2026-07-05.7";
 
   const STATUS = Object.freeze({
     DRAFT: "draft",
@@ -2802,7 +2803,7 @@
        - fetch(location.href, {cache:"reload"}) + a `?v=<ts>` cache-buster query so
          neither the HTTP cache nor a Service Worker can serve stale bytes.
        - NEVER auto-reloads (an in-progress intake/sale form must not be destroyed).
-         Only a user tap on the banner calls location.reload().
+         Only a user tap on the banner refreshes (cache-busted navigation).
        - Silent on any network error (offline is normal on a phone).
        - The banner shares the fixed slot family with #genPill; renderGenPill()
          handles stacking so they never overlap.
@@ -2811,6 +2812,7 @@
     let throttleMs = 5 * 60 * 1000;            // at most one check per 5 minutes
     let lastCheck = 0;
     let updateReady = false;                   // latched true once a newer build seen
+    let remoteVersion = null;                  // the newer version we saw (for cache-busting)
     // Test seam: the harness stubs fetch + shrinks the throttle without shipping it.
     let fetchImpl = (typeof fetch !== "undefined") ? fetch.bind(window) : null;
 
@@ -2849,16 +2851,23 @@
         const remote = parseVersion(text);
         // Only flag when we positively read a DIFFERENT version. A missing marker
         // (parse failed) is treated as "can't tell" → stay silent.
-        if (remote && remote !== APP_VERSION) showBanner();
+        if (remote && remote !== APP_VERSION) { remoteVersion = remote; showBanner(); }
       } catch (_) {
         /* offline / CORS / abort — silent by design */
       }
     }
 
-    // Wire the banner tap (reload) + boot/visibility checks.
+    // Cache-busted refresh URL. A plain location.reload() lets iOS serve the
+    // SAME stale cached document (SPE-29 — the update banner "did nothing" on
+    // device); navigating to a version-keyed query string forces a real fetch.
+    function bustUrl(v) {
+      return location.pathname + "?u=" + encodeURIComponent(v || Date.now());
+    }
+
+    // Wire the banner tap (cache-busted navigation) + boot/visibility checks.
     function init() {
       const el = document.getElementById("updateBanner");
-      if (el) el.addEventListener("click", function () { location.reload(); });
+      if (el) el.addEventListener("click", function () { location.replace(bustUrl(remoteVersion)); });
       document.addEventListener("visibilitychange", function () {
         if (document.visibilityState === "visible") check(false);
       });
@@ -2871,6 +2880,7 @@
 
     return {
       init: init, check: check, isReady: isReady, parseVersion: parseVersion,
+      bustUrl: bustUrl,
       __setFetch: __setFetch, __setThrottle: __setThrottle
     };
   })();
