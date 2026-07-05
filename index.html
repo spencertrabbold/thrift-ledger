@@ -1,0 +1,3819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <!-- Mobile-first viewport, tuned for ~390px iPhone. viewport-fit=cover lets us
+       paint into the safe-area (notch / home indicator) using env() insets below. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+
+  <!-- Home-screen install (Safari "Add to Home Screen") -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Thrift Ledger" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#111418" />
+
+  <title>Thrift Ledger</title>
+
+  <style>
+    /* =========================================================================
+       DESIGN TOKENS
+       ========================================================================= */
+    :root {
+      --bg:        #f5f6f8;
+      --surface:   #ffffff;
+      --surface-2: #eef0f3;
+      --ink:       #111418;
+      --ink-soft:  #565d66;
+      --ink-faint: #8b929b;
+      --line:      #e2e5ea;
+      --accent:    #2f6bff;
+      --accent-ink:#ffffff;
+      --good:      #1a9d5a;
+      --warn:      #c8781a;
+      --danger:    #d23b3b;
+
+      --tab-h: 64px;
+      --radius: 14px;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bot: env(safe-area-inset-bottom, 0px);
+
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+              Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--font);
+      font-size: 16px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+      overscroll-behavior-y: none;
+    }
+
+    /* App is a single fixed-height column: header / scrolling main / tab bar */
+    #app {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      min-height: 100dvh;
+      max-width: 640px;      /* stay phone-shaped on wide screens */
+      margin: 0 auto;
+      background: var(--bg);
+    }
+
+    /* ---- Header ---- */
+    header.app-header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      padding: calc(var(--safe-top) + 14px) 18px 12px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+    }
+    header.app-header h1 {
+      margin: 0;
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    header.app-header .sub {
+      margin: 2px 0 0;
+      font-size: 12.5px;
+      color: var(--ink-faint);
+    }
+
+    /* ---- Main scroll area ---- */
+    main.app-main {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      padding: 16px 16px calc(var(--tab-h) + var(--safe-bot) + 24px);
+    }
+
+    .view { display: none; }
+    .view.active { display: block; animation: fade .18s ease; }
+    @keyframes fade { from { opacity: 0; transform: translateY(4px);} to {opacity:1; transform:none;} }
+
+    /* ---- Cards / placeholders ---- */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+    .card h2 { margin: 0 0 6px; font-size: 15px; font-weight: 650; }
+    .muted { color: var(--ink-soft); font-size: 14px; }
+    .placeholder {
+      text-align: center;
+      color: var(--ink-faint);
+      padding: 40px 16px;
+    }
+    .placeholder .emoji { font-size: 34px; display: block; margin-bottom: 10px; }
+
+    .field { margin-bottom: 12px; }
+    .field label { display: block; font-size: 12.5px; color: var(--ink-soft); margin-bottom: 5px; font-weight: 600; }
+    .field input, .field select, .field textarea {
+      width: 100%;
+      font: inherit;
+      font-size: 16px;               /* >=16px stops iOS zoom-on-focus */
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .field textarea { resize: vertical; min-height: 72px; }
+
+    /* Review-step controls live outside .field (in .platform-block); give them
+       the same look as .field inputs. */
+    .platform-block textarea {
+      width: 100%;
+      font: inherit;
+      font-size: 16px;               /* >=16px stops iOS zoom-on-focus */
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--ink);
+      resize: vertical;
+    }
+
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%;
+      font: inherit; font-weight: 650; font-size: 16px;
+      padding: 13px 16px;
+      border: none; border-radius: 12px;
+      background: var(--accent); color: var(--accent-ink);
+      cursor: pointer;
+    }
+    .btn:active { filter: brightness(.94); }
+    .btn.secondary { background: var(--surface-2); color: var(--ink); }
+
+    /* ---- Bottom tab bar ---- */
+    nav.tab-bar {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      z-index: 20;
+      display: flex;
+      max-width: 640px;
+      margin: 0 auto;
+      background: rgba(255,255,255,0.92);
+      backdrop-filter: saturate(180%) blur(14px);
+      -webkit-backdrop-filter: saturate(180%) blur(14px);
+      border-top: 1px solid var(--line);
+      padding-bottom: var(--safe-bot);
+    }
+    nav.tab-bar button {
+      flex: 1 1 0;
+      display: flex; flex-direction: column; align-items: center; gap: 3px;
+      height: var(--tab-h);
+      padding: 8px 4px 0;
+      border: none; background: none; cursor: pointer;
+      color: var(--ink-faint);
+      font: inherit; font-size: 11px; font-weight: 600;
+    }
+    nav.tab-bar button .ico { font-size: 21px; line-height: 1; }
+    nav.tab-bar button.active { color: var(--accent); }
+
+    .badge {
+      display: inline-block; font-size: 11px; font-weight: 700;
+      padding: 2px 8px; border-radius: 999px;
+      background: var(--surface-2); color: var(--ink-soft);
+    }
+    .badge.listed { background: #e6efff; color: #2f6bff; }
+    .badge.sold   { background: #e4f6ec; color: var(--good); }
+    .badge.draft  { background: #f0f1f4; color: var(--ink-soft); }
+    .badge.not-listing { background: #f9ece1; color: var(--warn); }
+
+    .row { display: flex; gap: 12px; }
+    .row > * { flex: 1; }
+
+    /* =========================================================================
+       PHASE 2 (SPE-6..9) — intake / generation / review UI
+       ========================================================================= */
+
+    /* ---- Photo drop zone + thumbnail preview (SPE-6) ---- */
+    .photo-zone {
+      position: relative;
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      background: var(--surface-2);
+      overflow: hidden;
+    }
+    .photo-zone.empty {
+      text-align: center;
+      color: var(--ink-faint);
+      padding: 30px 16px;
+      cursor: pointer;
+    }
+    .photo-zone.empty .emoji { font-size: 32px; display: block; margin-bottom: 8px; }
+    .photo-zone.empty .hint { font-size: 12.5px; margin-top: 4px; color: var(--ink-faint); }
+    .photo-zone img.thumb {
+      display: block;
+      width: 100%;
+      max-height: 260px;
+      object-fit: contain;
+      background: #000;
+    }
+    .photo-zone .photo-actions {
+      display: flex;
+      gap: 8px;
+      padding: 8px;
+      background: var(--surface);
+      border-top: 1px solid var(--line);
+    }
+    .photo-zone .photo-actions .btn { font-size: 14px; padding: 9px 12px; }
+    .library-link {
+      display: block;
+      width: 100%;
+      margin-top: 8px;
+      font-size: 16px;
+    }
+
+    /* Visually-hidden file input (label wraps the zone) */
+    .visually-hidden {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+    }
+
+    /* ---- Inline validation error ---- */
+    .form-error {
+      color: var(--danger);
+      font-size: 13px;
+      font-weight: 600;
+      margin: 4px 0 12px;
+    }
+    .field.invalid input,
+    .field.invalid select { border-color: var(--danger); }
+
+    /* ---- Button variants ---- */
+    .btn.small { width: auto; font-size: 14px; padding: 9px 14px; }
+    .btn.ghost {
+      background: transparent; color: var(--accent);
+      border: 1px solid var(--line);
+    }
+    .btn.wide-row { flex: 1; }
+    .btn[disabled] { opacity: .55; cursor: default; }
+
+    /* ---- Loading state (SPE-7) ---- */
+    .loading-block { text-align: center; padding: 34px 16px; color: var(--ink-soft); }
+    .spinner {
+      width: 34px; height: 34px; margin: 0 auto 14px;
+      border: 3px solid var(--surface-2);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---- Item summary strip in review step ---- */
+    .item-strip { display: flex; gap: 12px; align-items: center; }
+    .item-strip img {
+      width: 56px; height: 56px; border-radius: 8px;
+      object-fit: cover; background: var(--surface-2); flex: 0 0 auto;
+    }
+    .item-strip .meta { min-width: 0; }
+    .item-strip .meta .t { font-weight: 650; font-size: 14px; }
+    .item-strip .meta .s { font-size: 12.5px; color: var(--ink-soft); }
+
+    /* ---- Per-platform review blocks (SPE-8/9) ---- */
+    .platform-block { margin-bottom: 14px; }
+    .platform-block .phead {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .platform-block .phead .pname {
+      font-size: 13px; font-weight: 700; text-transform: capitalize;
+      display: flex; align-items: center; gap: 7px;
+    }
+    .platform-block .phead .pdot {
+      width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+    }
+    .pdot.poshmark { background: #e0115f; }
+    .pdot.ebay     { background: #0064d2; }
+    .pdot.mercari  { background: #ff5a1f; }
+    .pdot.depop    { background: #ff2300; }
+
+    .platform-block .pactions { display: flex; gap: 8px; }
+    .platform-block .pactions .btn { font-size: 13px; padding: 8px 12px; }
+    .platform-block textarea { min-height: 84px; }
+
+    .copied-toast {
+      position: fixed;
+      left: 50%; bottom: calc(var(--tab-h) + var(--safe-bot) + 18px);
+      transform: translateX(-50%) translateY(8px);
+      background: var(--ink); color: #fff;
+      font-size: 13px; font-weight: 600;
+      padding: 9px 16px; border-radius: 999px;
+      z-index: 60; opacity: 0; pointer-events: none;
+      transition: opacity .18s ease, transform .18s ease;
+    }
+    .copied-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* Non-blocking storage warning banner (SPE-15 hardening). Sits above the tab
+       bar; auto-dismisses; never blocks interaction. */
+    .storage-warn {
+      position: fixed;
+      left: 12px; right: 12px;
+      bottom: calc(var(--tab-h) + var(--safe-bot) + 12px);
+      max-width: 616px; margin: 0 auto;
+      background: #3a2a12; color: #ffe9cf;
+      font-size: 13px; font-weight: 600; line-height: 1.35;
+      padding: 11px 14px; border-radius: 12px;
+      box-shadow: 0 6px 22px rgba(0,0,0,.28);
+      z-index: 70; opacity: 0; transform: translateY(8px);
+      transition: opacity .2s ease, transform .2s ease;
+      pointer-events: none;
+    }
+    .storage-warn.show { opacity: 1; transform: translateY(0); }
+
+    .section-label {
+      font-size: 12px; font-weight: 700; letter-spacing: .04em;
+      text-transform: uppercase; color: var(--ink-faint);
+      margin: 2px 0 10px;
+    }
+    .price-input-wrap { position: relative; }
+    .price-input-wrap span.dollar {
+      position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+      color: var(--ink-soft); font-size: 16px; pointer-events: none;
+    }
+    .price-input-wrap input { padding-left: 24px; }
+
+    /* =========================================================================
+       PHASE 3 (SPE-10 / SPE-11) — inventory list + item detail
+       ========================================================================= */
+
+    /* ---- Filter chips (horizontally scrollable) ---- */
+    .filter-chips {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      padding: 2px 2px 12px;
+      margin: 0 -2px;
+    }
+    .filter-chips::-webkit-scrollbar { display: none; }
+    .chip {
+      flex: 0 0 auto;
+      font: inherit; font-size: 13px; font-weight: 600;
+      padding: 7px 14px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--ink-soft);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .chip:active { filter: brightness(.96); }
+    .chip.active {
+      background: var(--ink);
+      color: #fff;
+      border-color: var(--ink);
+    }
+    .chip .count {
+      font-size: 11px;
+      opacity: .7;
+      margin-left: 4px;
+    }
+
+    /* ---- Inventory list rows ---- */
+    .inv-row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 10px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      text-align: left;
+      width: 100%;
+      font: inherit;
+      color: inherit;
+    }
+    .inv-row:active { filter: brightness(.98); }
+    .inv-thumb {
+      width: 60px; height: 60px;
+      flex: 0 0 auto;
+      border-radius: 9px;
+      object-fit: cover;
+      background: var(--surface-2);
+    }
+    .inv-thumb.placeholder-thumb {
+      display: flex; align-items: center; justify-content: center;
+      font-size: 26px; color: var(--ink-faint);
+    }
+    .inv-meta { min-width: 0; flex: 1 1 auto; }
+    .inv-meta .inv-title {
+      font-weight: 650; font-size: 14.5px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .inv-meta .inv-sub {
+      font-size: 12.5px; color: var(--ink-soft); margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .inv-meta .inv-badges { margin-top: 6px; display: flex; gap: 6px; align-items: center; }
+    .inv-chevron { flex: 0 0 auto; color: var(--ink-faint); font-size: 20px; padding-right: 4px; }
+
+    /* ---- Item detail view ---- */
+    .detail-back {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: none; border: none; cursor: pointer;
+      font: inherit; font-size: 15px; font-weight: 600;
+      color: var(--accent);
+      padding: 4px 0;
+      margin-bottom: 8px;
+    }
+    .detail-photo {
+      width: 100%;
+      max-height: 340px;
+      object-fit: contain;
+      background: #000;
+      border-radius: var(--radius);
+      display: block;
+    }
+    .detail-photo.placeholder-thumb {
+      display: flex; align-items: center; justify-content: center;
+      min-height: 180px; font-size: 44px; color: var(--ink-faint);
+      background: var(--surface-2);
+    }
+    .kv-list { margin: 6px 0 0; }
+    .kv-row {
+      display: flex; justify-content: space-between; gap: 12px;
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+    }
+    .kv-row:last-child { border-bottom: none; }
+    .kv-row .k { color: var(--ink-soft); flex: 0 0 auto; }
+    .kv-row .v { text-align: right; font-weight: 600; min-width: 0; word-break: break-word; }
+
+    /* Detail action buttons */
+    .detail-actions { display: flex; flex-direction: column; gap: 10px; }
+    .btn.danger { background: var(--danger); color: #fff; }
+    .btn.danger-ghost {
+      background: transparent; color: var(--danger);
+      border: 1px solid var(--danger);
+    }
+    .confirm-box {
+      background: #fdecec;
+      border: 1px solid #f3c0c0;
+      border-radius: 10px;
+      padding: 12px;
+      margin-top: 4px;
+    }
+    .confirm-box p { margin: 0 0 10px; font-size: 13.5px; color: var(--danger); font-weight: 600; }
+
+    /* =========================================================================
+       PHASE 4 (SPE-12 / SPE-13 / SPE-14) — sales, bundles & dashboard
+       ========================================================================= */
+
+    /* ---- In-detail "Mark as Sold" form (SPE-12) ---- */
+    .sale-form {
+      background: #eef7f0;
+      border: 1px solid #cfe8d8;
+      border-radius: 10px;
+      padding: 12px;
+      margin-top: 4px;
+    }
+    .sale-form .section-label { color: var(--good); }
+    .sale-form .field label { color: #2f6b4a; }
+    .sale-form .helper {
+      font-size: 12px; color: var(--ink-soft); margin: -6px 0 12px;
+    }
+    .sale-form .form-row { display: flex; gap: 10px; }
+    .sale-form .form-row > * { flex: 1; }
+
+    /* ---- Profit success moment (SPE-12/13) ---- */
+    .profit-pop {
+      text-align: center;
+      padding: 22px 14px;
+    }
+    .profit-pop .emoji { font-size: 34px; display: block; margin-bottom: 8px; }
+    .profit-pop .lbl { font-size: 13px; color: var(--ink-soft); font-weight: 600; }
+    .profit-pop .amt { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin-top: 2px; }
+    .profit-pop .amt.pos { color: var(--good); }
+    .profit-pop .amt.neg { color: var(--danger); }
+    .profit-pop .sub { font-size: 12.5px; color: var(--ink-faint); margin-top: 6px; }
+
+    /* Inline profit value colouring reused in kv rows and dashboard */
+    .v.pos { color: var(--good); }
+    .v.neg { color: var(--danger); }
+
+    /* ---- Sold / bundle info card ---- */
+    .sold-note {
+      background: #e4f6ec;
+      border: 1px solid #c6e8d3;
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-top: 10px;
+      font-size: 13px;
+      color: #1a6d43;
+      font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+    }
+
+    /* ---- Bundle multi-select mode (SPE-13) ---- */
+    .bundle-bar {
+      display: flex; gap: 10px; align-items: center;
+      margin-bottom: 12px;
+    }
+    .bundle-bar .btn { width: auto; }
+    .select-hint {
+      font-size: 13px; color: var(--ink-soft); font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .inv-row.selectable { cursor: pointer; }
+    .inv-row.selected {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent) inset;
+      background: #f2f6ff;
+    }
+    .sel-check {
+      flex: 0 0 auto;
+      width: 24px; height: 24px;
+      border-radius: 50%;
+      border: 2px solid var(--line);
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-size: 14px; font-weight: 800;
+      background: var(--surface);
+    }
+    .inv-row.selected .sel-check {
+      background: var(--accent); border-color: var(--accent);
+    }
+    .bundle-actionbar {
+      position: sticky;
+      bottom: 0;
+      display: flex; gap: 10px;
+      padding: 12px 0 4px;
+      background: linear-gradient(to top, var(--bg) 70%, transparent);
+    }
+    .bundle-actionbar .btn { margin: 0; }
+
+    /* ---- Dashboard (SPE-14) ---- */
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 13px 14px;
+    }
+    .stat .stat-lbl {
+      font-size: 11.5px; font-weight: 700; letter-spacing: .03em;
+      text-transform: uppercase; color: var(--ink-faint);
+    }
+    .stat .stat-val { font-size: 21px; font-weight: 750; margin-top: 3px; letter-spacing: -0.01em; }
+    .stat.hero { grid-column: 1 / -1; padding: 18px 16px; }
+    .stat.hero .stat-val { font-size: 34px; font-weight: 850; letter-spacing: -0.02em; }
+    .stat .stat-val.pos { color: var(--good); }
+    .stat .stat-val.neg { color: var(--danger); }
+    .stat .stat-note { font-size: 12px; color: var(--ink-soft); margin-top: 5px; }
+
+    .count-strip {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px;
+    }
+    .count-pill {
+      display: inline-flex; align-items: baseline; gap: 5px;
+      font-size: 12.5px; font-weight: 600; color: var(--ink-soft);
+      background: var(--surface-2);
+      padding: 5px 11px; border-radius: 999px;
+    }
+    .count-pill b { font-size: 13.5px; color: var(--ink); }
+
+    /* ---- Recent sales rows ---- */
+    .sale-row {
+      display: flex; gap: 12px; align-items: center;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 10px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      text-align: left; width: 100%;
+      font: inherit; color: inherit;
+    }
+    .sale-row:active { filter: brightness(.98); }
+    .sale-thumb-wrap { position: relative; flex: 0 0 auto; width: 60px; height: 60px; }
+    .sale-thumb-wrap .inv-thumb { width: 60px; height: 60px; }
+    .sale-thumb-wrap .nbadge {
+      position: absolute; right: -4px; bottom: -4px;
+      background: var(--ink); color: #fff;
+      font-size: 11px; font-weight: 800;
+      padding: 2px 7px; border-radius: 999px;
+      border: 2px solid var(--surface);
+    }
+    .sale-meta { min-width: 0; flex: 1 1 auto; }
+    .sale-meta .sale-title {
+      font-weight: 650; font-size: 14.5px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .sale-meta .sale-sub {
+      font-size: 12.5px; color: var(--ink-soft); margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .sale-right { flex: 0 0 auto; text-align: right; }
+    .sale-right .sale-amt { font-weight: 700; font-size: 14.5px; }
+    .sale-right .sale-profit { font-size: 12.5px; font-weight: 650; margin-top: 3px; }
+    .sale-right .sale-profit.pos { color: var(--good); }
+    .sale-right .sale-profit.neg { color: var(--danger); }
+
+    /* Expanded bundle sub-items under a bundle sale row */
+    .bundle-children {
+      margin: -4px 0 10px;
+      padding: 4px 0 4px 12px;
+      border-left: 2px solid var(--line);
+    }
+    .bundle-child {
+      display: flex; gap: 10px; align-items: center;
+      padding: 7px 8px;
+      border-radius: 10px;
+      cursor: pointer;
+      width: 100%; text-align: left; font: inherit; color: inherit;
+      background: none; border: none;
+    }
+    .bundle-child:active { background: var(--surface-2); }
+    .bundle-child .inv-thumb { width: 40px; height: 40px; border-radius: 7px; }
+    .bundle-child .bc-meta { min-width: 0; flex: 1 1 auto; }
+    .bundle-child .bc-title {
+      font-size: 13.5px; font-weight: 600;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .bundle-child .bc-sub { font-size: 12px; color: var(--ink-soft); }
+    .bundle-child .bc-chevron { color: var(--ink-faint); font-size: 18px; }
+
+    /* =========================================================================
+       PHASE 6 (SPE-19) — settings gear, settings modal, backup / restore
+       ========================================================================= */
+
+    /* Gear button, top-right of the sticky header. */
+    header.app-header { position: sticky; } /* (already sticky; kept for locality) */
+    .gear-btn {
+      position: absolute;
+      top: calc(var(--safe-top) + 12px);
+      right: 14px;
+      width: 38px; height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--ink-soft);
+      font-size: 20px; line-height: 1;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      padding: 0;
+    }
+    .gear-btn:active { filter: brightness(.95); }
+
+    /* Full-screen modal overlay for Settings. */
+    .modal-overlay {
+      position: fixed; inset: 0;
+      z-index: 80;
+      background: rgba(17, 20, 24, 0.45);
+      display: flex; flex-direction: column;
+      opacity: 0;
+      transition: opacity .18s ease;
+    }
+    .modal-overlay.show { opacity: 1; }
+    .modal-sheet {
+      background: var(--bg);
+      max-width: 640px;
+      width: 100%;
+      margin: auto auto 0;         /* slide up from the bottom on phones */
+      max-height: 92%;
+      display: flex; flex-direction: column;
+      border-top-left-radius: 18px;
+      border-top-right-radius: 18px;
+      overflow: hidden;
+      transform: translateY(16px);
+      transition: transform .2s ease;
+    }
+    .modal-overlay.show .modal-sheet { transform: translateY(0); }
+    .modal-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: calc(var(--safe-top) + 14px) 18px 12px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      flex: 0 0 auto;
+    }
+    .modal-head h2 { margin: 0; font-size: 17px; font-weight: 700; }
+    .modal-close {
+      background: none; border: none; cursor: pointer;
+      font-size: 26px; line-height: 1; color: var(--ink-soft);
+      padding: 2px 6px;
+    }
+    .modal-body {
+      flex: 1 1 auto;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      padding: 16px 16px calc(var(--safe-bot) + 24px);
+    }
+
+    /* AI mode indicator pill inside settings. */
+    .mode-indicator {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-size: 13px; font-weight: 650;
+      padding: 6px 12px; border-radius: 999px;
+      background: var(--surface-2); color: var(--ink-soft);
+    }
+    .mode-indicator .dot {
+      width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+      background: var(--ink-faint);
+    }
+    .mode-indicator.builtin .dot,
+    .mode-indicator.api .dot { background: var(--good); }
+    .mode-indicator.mock .dot { background: var(--warn); }
+
+    .privacy-note {
+      font-size: 12px; color: var(--ink-faint);
+      margin: 8px 0 0; line-height: 1.4;
+    }
+    .key-saved-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+    .key-saved-row .masked { font-family: monospace; font-weight: 600; }
+
+    /* Inline test / import feedback line. */
+    .settings-feedback {
+      font-size: 13px; font-weight: 600;
+      margin: 8px 0 0; line-height: 1.4;
+    }
+    .settings-feedback.ok  { color: var(--good); }
+    .settings-feedback.err { color: var(--danger); }
+    .settings-feedback.info { color: var(--ink-soft); }
+
+    .btn.tiny { width: auto; font-size: 13px; padding: 8px 12px; }
+    .settings-btn-row { display: flex; gap: 10px; }
+    .settings-btn-row > * { flex: 1; }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <header class="app-header">
+      <button class="gear-btn" id="settingsBtn" type="button" aria-label="Settings" title="Settings">&#9881;</button>
+      <h1>Thrift Ledger</h1>
+      <p class="sub" id="headerSub">Photo &rarr; listing &rarr; sold &rarr; profit</p>
+    </header>
+
+    <main class="app-main">
+      <!-- ================= ADD ITEM ================= -->
+      <!-- The Add Item tab is a small multi-step flow (SPE-6..9), rendered
+           entirely by renderAdd() into #addFlow. Steps: intake -> generate
+           -> review/edit -> done. See the [ADD FLOW] section in the script. -->
+      <section class="view" id="view-add" data-tab="add">
+        <div id="addFlow"></div>
+      </section>
+
+      <!-- ================= INVENTORY ================= -->
+      <section class="view" id="view-inventory" data-tab="inventory">
+        <div id="inventoryList"></div>
+      </section>
+
+      <!-- ================= DASHBOARD ================= -->
+      <section class="view" id="view-dashboard" data-tab="dashboard">
+        <div id="dashboardBody"></div>
+      </section>
+    </main>
+
+    <nav class="tab-bar" id="tabBar">
+      <button data-tab="add" class="active"><span class="ico">&#43;</span>Add Item</button>
+      <button data-tab="inventory"><span class="ico">&#128230;</span>Inventory</button>
+      <button data-tab="dashboard"><span class="ico">&#128202;</span>Dashboard</button>
+    </nav>
+  </div>
+
+  <script>
+  "use strict";
+  /* ===========================================================================
+     THRIFT LEDGER  —  app.js (inline, single-file artifact)
+
+     File map for the four agents extending this after SPE-5:
+       [DATA MODEL]  canonical schema + invariants (comment block, read first)
+       [STORAGE]     async adapter over window.storage / localStorage
+       [STORE]       AppStore: state + mutations + subscribe/notify + factories
+       [VIEWS]       one render fn per tab; read ONLY through AppStore
+       [ROUTER]      tab switching
+       [BOOT]        load-on-boot, wire events, first render
+
+     GOLDEN RULES for later phases:
+       - Views never touch storage or the raw state object directly. Go through
+         AppStore getters/mutators. Mutators call notify() -> views re-render.
+       - Never mutate objects returned from getters in place; use AppStore.updateItem.
+       - Money is stored as DOLLARS (Number, float). See [DATA MODEL].
+       - Bump SCHEMA_VERSION + add a migration if you change record shape.
+     =========================================================================== */
+
+  /* ===========================================================================
+     [DATA MODEL]  — CANONICAL SCHEMA (v1). This is the contract for SPE-6..14.
+     ---------------------------------------------------------------------------
+     MONEY UNITS: all money is stored as DOLLARS in a JS Number (e.g. 12.50).
+       Not cents. Chosen for readability + because window.storage is JSON and
+       these values are small. Round to 2dp on display, not on store.
+
+     Item = {
+       id:        string,   // uid(), stable, primary key
+       createdAt: number,   // Date.now() epoch ms
+       photo:     string|null,   // compressed image dataURL ("data:image/...") or null.
+                                 //   Compression handled in SPE-6. Nullable so a
+                                 //   record can exist before/without a photo.
+       category:  string,   // free text, e.g. "Dress"
+       brand:     string,   // free text, e.g. "Zara"  ("" if unknown)
+       size:      string,   // free text, e.g. "M"
+       condition: string,   // free text enum-ish, e.g. "Like new"
+       costPaid:  number,   // DOLLARS Alissa paid to acquire it. Counts toward
+                            //   total spend for ALL statuses (incl. not-listing).
+
+       status:    'draft' | 'listed' | 'sold' | 'not-listing',
+                            //   draft       - saved, not yet listed on any platform
+                            //   listed      - live on >=1 platform, in active inventory
+                            //   sold        - sold (single or via a bundle); keeps listing data
+                            //   not-listing - deliberately kept off-market (SPE-11):
+                            //                 still counts in total spend, hidden from
+                            //                 the ACTIVE inventory view.
+
+       listing:   null | {          // AI-generated + user-edited listing content (SPE-7/8)
+         title:         string,
+         description:   string,
+         suggestedPrice:number,     // DOLLARS. Default for sale price (SPE-12), editable.
+         platforms: {               // per-platform listing text (SPE-7). "" until generated.
+           poshmark: string,
+           ebay:     string,
+           mercari:  string,
+           depop:    string
+         }
+       },
+
+       sale:      null | {          // set when status becomes 'sold' (SPE-12/13)
+         price:    number,          // DOLLARS actually sold for (editable, may != suggested)
+         platform: string,          // 'poshmark' | 'ebay' | 'mercari' | 'depop' | other
+         fee:      number,          // DOLLARS platform/shipping fee for THIS sale.
+                                    //   For a bundled item this is 0 — the fee lives on
+                                    //   the Bundle, never split per item (see invariants).
+         date:     number,          // epoch ms of sale
+         bundleId: string|null      // null = single sale; else FK -> Bundle.id
+       }
+     }
+
+     Bundle = {                     // one multi-item sale (SPE-13)
+       id:         string,          // uid()
+       date:       number,          // epoch ms
+       platform:   string,          // where the bundle sold
+       totalPrice: number,          // DOLLARS for the whole bundle (one number)
+       fee:        number,          // DOLLARS one fee for the whole bundle
+       itemIds:    string[]         // Item.id[] included in this bundle
+     }
+     // Bundle profit = totalPrice - sum(costPaid of its items) - fee.
+     // Tracked at the bundle level ONLY. Never split back to per-item profit.
+
+     Root persisted blob (single key):
+       { schemaVersion:1, items: Item[], bundles: Bundle[] }
+
+     -------------------- INVARIANTS (enforce in later phases) -----------------
+     I1. costPaid of EVERY item (any status, incl. 'not-listing' and 'sold')
+         counts toward TOTAL SPEND on the dashboard.
+     I2. 'not-listing' items are excluded from the ACTIVE inventory view but
+         remain in storage and in total-spend math.
+     I3. 'sold' items RETAIN their .listing data (do not clear it on sale).
+     I4. A bundled item has sale.bundleId set and sale.fee = 0; its revenue/fee
+         is represented by its Bundle, not by the item. Dashboards must render
+         per-bundle rows, not synthetic per-item splits.
+     I5. Single-sale profit  = item.sale.price - item.costPaid - item.sale.fee.
+         Bundle profit        = bundle.totalPrice
+                                - sum(item.costPaid for item in bundle.itemIds)
+                                - bundle.fee.
+     =========================================================================== */
+
+  const SCHEMA_VERSION = 1;
+  const ROOT_KEY = "thrift-ledger:v1";
+
+  const STATUS = Object.freeze({
+    DRAFT: "draft",
+    LISTED: "listed",
+    SOLD: "sold",
+    NOT_LISTING: "not-listing"
+  });
+  const PLATFORMS = Object.freeze(["poshmark", "ebay", "mercari", "depop"]);
+
+  /* ---------------------------------------------------------------------------
+     PLATFORM "create listing" URLs (SPE-9).
+     ONE editable map — verified on-device in SPE-18; fix here if a link lands
+     wrong. Depop's create URL is a best guess and needs device verification.
+     --------------------------------------------------------------------------- */
+  const PLATFORM_URLS = Object.freeze({
+    poshmark: "https://poshmark.com/create-listing",
+    ebay:     "https://www.ebay.com/sl/sell",
+    mercari:  "https://www.mercari.com/sell/",
+    depop:    "https://www.depop.com/products/create/"   // best guess — verify on device (SPE-18)
+  });
+
+  const PLATFORM_LABELS = Object.freeze({
+    poshmark: "Poshmark", ebay: "eBay", mercari: "Mercari", depop: "Depop"
+  });
+
+  /* Sensible clothing-resale category list for the intake select (SPE-6).
+     "Other…" reveals a free-text field so nothing is un-enterable. */
+  const CATEGORY_OPTIONS = Object.freeze([
+    "Dress", "Top / Blouse", "T-Shirt", "Sweater / Cardigan", "Sweatshirt / Hoodie",
+    "Jacket / Coat", "Blazer", "Jeans", "Pants / Trousers", "Shorts", "Skirt",
+    "Activewear", "Swimwear", "Jumpsuit / Romper", "Shoes", "Boots", "Sneakers",
+    "Bag / Purse", "Accessory", "Jewelry", "Hat"
+  ]);
+
+  const CONDITION_OPTIONS = Object.freeze(["NWT", "Excellent", "Good", "Fair"]);
+  // How each condition reads in generated copy.
+  const CONDITION_LABELS = Object.freeze({
+    "NWT": "New With Tags",
+    "Excellent": "Excellent",
+    "Good": "Good",
+    "Fair": "Fair"
+  });
+
+  // Photo compression params (SPE-6). Longest edge cap + JPEG quality.
+  const PHOTO_MAX_EDGE = 800;
+  const PHOTO_QUALITY = 0.7;
+
+  /* ===========================================================================
+     PHASE 6 (SPE-19) — static-hosting enablement: direct Anthropic API,
+     settings screen, backup / restore.
+     ---------------------------------------------------------------------------
+     On a static host (GitHub Pages, "Add to Home Screen") window.claude does not
+     exist. AIListing resolves generation through a provider chain:
+       1. window.claude.complete   (artifact runtime — unchanged)
+       2. direct Anthropic Messages API, if an API key is configured
+       3. mock generator (clearly labelled)
+     The API key lives under its OWN storage key (NOT inside the main data blob),
+     so data exports never leak it.
+     =========================================================================== */
+  const API_KEY_STORAGE = "thrift-ledger:apikey";
+  const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+  const ANTHROPIC_VERSION = "2023-06-01";
+  const ANTHROPIC_MODEL = "claude-opus-4-8";
+  // 60s: web search runs real comparable-price research server-side and is slow.
+  const API_TIMEOUT_MS = 60000;
+  const API_MAX_CONTINUATIONS = 3;   // pause_turn server-tool-loop continuations
+
+  /* ===========================================================================
+     [STORAGE]  — async key/value adapter.
+     ---------------------------------------------------------------------------
+     Persistence target is claude.ai's `window.storage` (async, private per user).
+     Its method names are not guaranteed, so we feature-detect get/set/delete AND
+     getItem/setItem/removeItem. Falls back to localStorage for local dev.
+
+     Public API (all async, Promise-returning):
+       Storage.get(key)          -> parsed value | null
+       Storage.set(key, value)   -> void   (value is JSON-serialized)
+       Storage.delete(key)       -> void
+       Storage.backend           -> "window.storage" | "localStorage"
+     =========================================================================== */
+  const Storage = (function () {
+    const ws = (typeof window !== "undefined") ? window.storage : null;
+
+    // Pick the matching method name pair the host actually exposes.
+    function pick(obj, names) {
+      if (!obj) return null;
+      for (const n of names) if (typeof obj[n] === "function") return n;
+      return null;
+    }
+    const getM = pick(ws, ["get", "getItem"]);
+    const setM = pick(ws, ["set", "setItem"]);
+    const delM = pick(ws, ["delete", "remove", "removeItem"]);
+    const usable = ws && getM && setM;
+    const backend = usable ? "window.storage" : "localStorage";
+
+    // Non-blocking warning sink. Boot registers a DOM-based handler (banner);
+    // until then (and if none registers) we just log. Never throws, never blocks.
+    let warnSink = null;
+    function onWarn(fn) { warnSink = fn; }
+    function warn(msg) {
+      console.warn("[Storage] " + msg);
+      try { if (warnSink) warnSink(msg); } catch (_) {}
+    }
+
+    // Values are always stored as JSON strings so both backends behave alike.
+    async function rawGet(key) {
+      if (usable) return await ws[getM](key);
+      return (typeof localStorage !== "undefined") ? localStorage.getItem(key) : null;
+    }
+    async function rawSet(key, str) {
+      if (usable) return await ws[setM](key, str);
+      if (typeof localStorage !== "undefined") localStorage.setItem(key, str);
+    }
+    async function rawDel(key) {
+      if (usable && delM) return await ws[delM](key);
+      if (typeof localStorage !== "undefined") localStorage.removeItem(key);
+    }
+
+    // Warn once when a single blob gets large (photos are the driver). window.storage
+    // and localStorage quotas vary; ~4MB is a conservative "getting risky" line.
+    const SIZE_WARN_BYTES = 4 * 1024 * 1024;
+    let sizeWarned = false;
+
+    return {
+      backend,
+      onWarn,
+      /**
+       * get(key) -> parsed value | null.
+       * A corrupt/unparseable stored blob must NOT brick the app on boot: we
+       * preserve the raw bytes under a timestamped ":corrupt-<ts>" backup key so
+       * nothing is silently destroyed, warn non-blockingly, and return null so the
+       * caller boots clean. Some hosts hand back already-parsed objects — passed
+       * through untouched.
+       */
+      async get(key) {
+        let v;
+        try {
+          v = await rawGet(key);
+        } catch (e) {
+          warn("read failed — starting from last good state. (" + (e && e.message || e) + ")");
+          return null;
+        }
+        if (v == null) return null;
+        if (typeof v !== "string") return v; // host returned a parsed object
+        try {
+          return JSON.parse(v);
+        } catch (e) {
+          // Corrupt JSON. Back up the raw blob before the caller overwrites it.
+          try {
+            await rawSet(key + ":corrupt-" + Date.now(), v);
+            warn("saved data was corrupted; a backup copy was kept and the app started fresh.");
+          } catch (_) {
+            warn("saved data was corrupted and couldn't be backed up; the app started fresh.");
+          }
+          return null;
+        }
+      },
+      async set(key, value) {
+        let str;
+        try {
+          str = JSON.stringify(value);
+        } catch (e) {
+          warn("couldn't serialize data to save: " + (e && e.message || e));
+          return;
+        }
+        if (!sizeWarned && str.length > SIZE_WARN_BYTES) {
+          sizeWarned = true;
+          warn("your saved photos are getting large (~" + Math.round(str.length / (1024 * 1024)) +
+               "MB). If saving starts failing, delete some sold items.");
+        }
+        try {
+          await rawSet(key, str);
+        } catch (e) {
+          // Quota exceeded or host failure. Must not crash — surface a small warning.
+          warn("couldn't save your latest change (storage may be full). " +
+               "Recent edits are safe in the app but may not survive a reload until space frees up.");
+        }
+      },
+      async delete(key) {
+        try { await rawDel(key); }
+        catch (e) { console.warn("[Storage] delete failed:", e); }
+      }
+    };
+  })();
+
+  /* ===========================================================================
+     [API KEY]  — SPE-19. Anthropic API key stored under its OWN storage key,
+     separate from the main data blob so exports never include it. All async
+     over the same Storage adapter (window.storage / localStorage fallback).
+     =========================================================================== */
+  const ApiKey = (function () {
+    let cached = null;   // in-memory copy so the provider check is synchronous-ish
+    let loaded = false;
+
+    async function load() {
+      try {
+        const v = await Storage.get(API_KEY_STORAGE);
+        cached = (typeof v === "string" && v.trim()) ? v.trim() : null;
+      } catch (_) {
+        cached = null;
+      }
+      loaded = true;
+      return cached;
+    }
+    function get() { return cached; }          // null when unset
+    function has() { return !!cached; }
+    async function set(key) {
+      const k = (key == null ? "" : String(key)).trim();
+      cached = k || null;
+      if (k) await Storage.set(API_KEY_STORAGE, k);
+      else await Storage.delete(API_KEY_STORAGE);
+    }
+    async function clear() {
+      cached = null;
+      await Storage.delete(API_KEY_STORAGE);
+    }
+    // Masked display: sk-ant-…last4 (never reveal the full key on screen).
+    function masked() {
+      if (!cached) return "";
+      const last4 = cached.slice(-4);
+      return "sk-ant-…" + last4;
+    }
+    return { load: load, get: get, has: has, set: set, clear: clear, masked: masked, isLoaded: function () { return loaded; } };
+  })();
+
+  /* ===========================================================================
+     [STORE]  — AppStore: single source of truth.
+     ---------------------------------------------------------------------------
+     Holds { schemaVersion, items, bundles }. Views subscribe(); every mutator
+     calls persist() (debounced) + notify() so views re-render. Getters return
+     data; never mutate returned objects directly — use updateItem.
+     =========================================================================== */
+  const AppStore = (function () {
+    let state = { schemaVersion: SCHEMA_VERSION, items: [], bundles: [] };
+    const subscribers = new Set();
+    let ready = false;
+
+    // ---- id + factory helpers (exposed so intake code stays consistent) ----
+    function uid() {
+      return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 9);
+    }
+
+    // Factory: a blank Item honoring the schema. Overrides merged shallowly.
+    function makeItem(overrides = {}) {
+      return Object.assign({
+        id: uid(),
+        createdAt: Date.now(),
+        photo: null,
+        category: "",
+        brand: "",
+        size: "",
+        condition: "",
+        costPaid: 0,
+        status: STATUS.DRAFT,
+        listing: null,
+        sale: null
+      }, overrides);
+    }
+
+    function makeListing(overrides = {}) {
+      return Object.assign({
+        title: "",
+        description: "",
+        suggestedPrice: 0,
+        platforms: { poshmark: "", ebay: "", mercari: "", depop: "" }
+      }, overrides);
+    }
+
+    function makeBundle(overrides = {}) {
+      return Object.assign({
+        id: uid(),
+        date: Date.now(),
+        platform: "",
+        totalPrice: 0,
+        fee: 0,
+        itemIds: []
+      }, overrides);
+    }
+
+    // ---- migrations: hook for future schema bumps ----
+    function migrate(blob) {
+      if (!blob || typeof blob !== "object") {
+        return { schemaVersion: SCHEMA_VERSION, items: [], bundles: [] };
+      }
+      // v0/undefined -> v1: ensure required arrays + version exist.
+      if (!Array.isArray(blob.items)) blob.items = [];
+      if (!Array.isArray(blob.bundles)) blob.bundles = [];
+      // (future) if (blob.schemaVersion < 2) { ...transform... }
+      blob.schemaVersion = SCHEMA_VERSION;
+      return blob;
+    }
+
+    // ---- persistence (debounced) ----
+    // Debounce coalesces bursts (e.g. per-keystroke listing edits) into one write.
+    // Kept short (150ms) to shrink the window where an immediate reload could beat
+    // an un-flushed write; flush() on pagehide/hidden covers the rest (SPE-15).
+    const PERSIST_DEBOUNCE_MS = 150;
+    let persistTimer = null;
+    function persist() {
+      if (persistTimer) clearTimeout(persistTimer);
+      persistTimer = setTimeout(() => {
+        persistTimer = null;
+        Storage.set(ROOT_KEY, state);
+      }, PERSIST_DEBOUNCE_MS);
+    }
+    // Flush immediately (e.g. before unload). Synchronous on the localStorage
+    // backend (write lands before the page tears down); best-effort on the async
+    // window.storage backend, where the preceding visibilitychange:hidden flush is
+    // the reliable belt.
+    async function flush() {
+      if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+      await Storage.set(ROOT_KEY, state);
+    }
+
+    // ---- subscribe / notify ----
+    function subscribe(fn) { subscribers.add(fn); return () => subscribers.delete(fn); }
+    function notify() { subscribers.forEach(fn => { try { fn(state); } catch (e) { console.error(e); } }); }
+
+    // Internal: any mutation goes through here to keep persist+notify paired.
+    function commit() { persist(); notify(); }
+
+    // ---- boot ----
+    async function load() {
+      const blob = await Storage.get(ROOT_KEY);
+      state = migrate(blob);
+      ready = true;
+      notify();          // first paint with loaded data
+      return state;
+    }
+
+    // Replace the entire store from an imported backup (SPE-19). Runs the blob
+    // through migrate() (which deep-clones nothing but normalizes shape), persists
+    // immediately (not debounced — an import is a deliberate, one-shot action),
+    // and notifies so every view re-renders. Returns true on success.
+    async function replaceAll(blob) {
+      try {
+        // Clone so we own the object (caller may hold a reference to the parsed file).
+        const cloned = JSON.parse(JSON.stringify(blob));
+        state = migrate(cloned);
+        await flush();   // write through immediately
+        notify();
+        return true;
+      } catch (e) {
+        console.error("[AppStore] replaceAll failed:", e);
+        return false;
+      }
+    }
+
+    // ---- read API (return copies of arrays; item objects are shared refs —
+    //      treat as read-only, mutate via updateItem) ----
+    function getState() { return state; }
+    function isReady() { return ready; }
+
+    function getItem(id) { return state.items.find(i => i.id === id) || null; }
+    function getBundle(id) { return state.bundles.find(b => b.id === id) || null; }
+
+    /**
+     * listItems(filter)
+     *   filter omitted            -> all items (newest first)
+     *   filter.status = STATUS.x  -> by exact status
+     *   filter.active = true      -> ACTIVE inventory view: excludes 'not-listing'
+     *                                (invariant I2). By default also excludes sold?
+     *                                No — active keeps sold visible; only 'not-listing'
+     *                                and nothing else is hidden. Callers refine further.
+     */
+    function listItems(filter = {}) {
+      let out = state.items.slice();
+      if (filter.status) out = out.filter(i => i.status === filter.status);
+      if (filter.active) out = out.filter(i => i.status !== STATUS.NOT_LISTING);
+      out.sort((a, b) => b.createdAt - a.createdAt);
+      return out;
+    }
+    function listBundles() { return state.bundles.slice().sort((a, b) => b.date - a.date); }
+
+    // ---- write API ----
+    function addItem(partial = {}) {
+      const item = makeItem(partial);
+      state.items.push(item);
+      commit();
+      return item;
+    }
+
+    // Shallow-merge patch onto an existing item. Returns updated item or null.
+    function updateItem(id, patch) {
+      const item = getItem(id);
+      if (!item) return null;
+      Object.assign(item, patch);
+      commit();
+      return item;
+    }
+
+    function removeItem(id) {
+      const n = state.items.length;
+      state.items = state.items.filter(i => i.id !== id);
+      if (state.items.length !== n) commit();
+    }
+
+    function addBundle(partial = {}) {
+      const bundle = makeBundle(partial);
+      state.bundles.push(bundle);
+      commit();
+      return bundle;
+    }
+    function updateBundle(id, patch) {
+      const b = getBundle(id);
+      if (!b) return null;
+      Object.assign(b, patch);
+      commit();
+      return b;
+    }
+    function removeBundle(id) {
+      const n = state.bundles.length;
+      state.bundles = state.bundles.filter(b => b.id !== id);
+      if (state.bundles.length !== n) commit();
+    }
+
+    return {
+      // constants / factories
+      STATUS, PLATFORMS, uid, makeItem, makeListing, makeBundle,
+      // lifecycle
+      load, flush, isReady, subscribe, getState, replaceAll,
+      // reads
+      getItem, getBundle, listItems, listBundles,
+      // writes
+      addItem, updateItem, removeItem, addBundle, updateBundle, removeBundle
+    };
+  })();
+
+  /* ===========================================================================
+     [AI LISTING]  — SPE-7. Turn item fields into a listing draft.
+     ---------------------------------------------------------------------------
+     Live path: window.claude.complete(prompt) -> model text (async). We feature
+     -detect it. The prompt asks Claude to research/estimate realistic comparable
+     resale prices and reply with ONLY a JSON object of the exact shape:
+        { title, description, suggestedPrice, platforms:{poshmark,ebay,mercari,depop} }
+     We parse defensively: strip markdown fences, grab the first {...} block,
+     JSON.parse in try/catch. On any failure we throw so the UI shows Retry.
+
+     NOTE: complete() takes text only — the photo can't be passed as an image.
+     We describe the item from the structured fields and mention that a photo
+     exists (so copy can reference "pictured").
+
+     Dev path: when window.claude is absent, MOCK generator returns plausible,
+     clearly-labelled placeholder content after a short delay so the whole flow
+     is testable locally.
+     =========================================================================== */
+  const AIListing = (function () {
+    // Artifact runtime available?
+    function hasClaudeComplete() {
+      return typeof window !== "undefined" &&
+             window.claude &&
+             typeof window.claude.complete === "function";
+    }
+    // Active provider (SPE-19). Chain: window.claude -> direct API -> mock.
+    //   "builtin" -> window.claude.complete   (real research, artifact host)
+    //   "api"     -> direct Anthropic Messages API with the user's key
+    //   "mock"    -> local placeholder generator
+    function mode() {
+      if (hasClaudeComplete()) return "builtin";
+      if (ApiKey.has()) return "api";
+      return "mock";
+    }
+    // "Live" = produces real research (either built-in or direct API). Kept for
+    // callers that only care whether copy will be real vs. mock.
+    function isLive() {
+      return mode() !== "mock";
+    }
+
+    function itemDescriptor(payload) {
+      const parts = [];
+      if (payload.brand) parts.push("Brand: " + payload.brand);
+      if (payload.category) parts.push("Category/type: " + payload.category);
+      if (payload.size) parts.push("Size: " + payload.size);
+      if (payload.condition) parts.push("Condition: " + (CONDITION_LABELS[payload.condition] || payload.condition));
+      parts.push("Seller paid: $" + (Number(payload.costPaid) || 0).toFixed(2) + " to acquire it");
+      if (payload.photo) parts.push("A photo of the item is available to the seller (the item is pictured).");
+      return parts.join("\n");
+    }
+
+    // The exact prompt contract. Kept in one place so SPE-16 can tune copy.
+    // When `useWebSearch` is true (direct-API path), instruct the model to run
+    // real web-search comparable-price research before pricing.
+    function buildPrompt(payload, useWebSearch) {
+      const priceTask = useWebSearch
+        ? "1. Use web search to research current sold/asking prices for comparable items on\n" +
+          "   Poshmark, eBay, Mercari, and Depop before setting suggestedPrice. Pick a single\n" +
+          "   suggested list price that is competitive but not underpriced."
+        : "1. Research and estimate a realistic comparable resale price (in USD) for this\n" +
+          "   item based on its brand, category, and condition on secondhand marketplaces\n" +
+          "   (Poshmark, eBay, Mercari, Depop). Pick a single suggested list price that is\n" +
+          "   competitive but not underpriced.";
+      return [
+        "You are an expert secondhand-clothing reseller writing marketplace listings.",
+        "",
+        "ITEM DETAILS:",
+        itemDescriptor(payload),
+        "",
+        "TASK:",
+        priceTask,
+        "2. Write a compelling title and description.",
+        "3. Write four platform-specific listing texts, each tuned to that platform's culture:",
+        "   - poshmark: chatty and friendly, include relevant #hashtags, put the size in the title-like opener.",
+        "   - ebay: keyword-stuffed, searchable, include item specifics (brand, size, type, condition, color/material if inferable).",
+        "   - mercari: concise and to the point.",
+        "   - depop: lowercase, casual, trend-aware, include #hashtags.",
+        "",
+        "RESPOND WITH ONLY a single JSON object, no prose, no markdown fences, matching EXACTLY:",
+        '{',
+        '  "title": string,',
+        '  "description": string,',
+        '  "suggestedPrice": number,',
+        '  "platforms": { "poshmark": string, "ebay": string, "mercari": string, "depop": string }',
+        '}'
+      ].join("\n");
+    }
+
+    // Scan a string for the LAST balanced {...} object that JSON.parse accepts.
+    // The direct-API web-search path can emit several text blocks; the final
+    // JSON object is the listing (earlier braces may appear in prose/results).
+    // Falls back to null if none parse.
+    function extractLastJsonObject(s) {
+      let best = null;
+      // Walk every "{" and, for each, find its matching "}" via brace-depth,
+      // trying to parse the slice. Keep the last one that parses.
+      for (let i = 0; i < s.length; i++) {
+        if (s[i] !== "{") continue;
+        let depth = 0, inStr = false, esc = false;
+        for (let j = i; j < s.length; j++) {
+          const ch = s[j];
+          if (inStr) {
+            if (esc) { esc = false; }
+            else if (ch === "\\") { esc = true; }
+            else if (ch === '"') { inStr = false; }
+            continue;
+          }
+          if (ch === '"') { inStr = true; }
+          else if (ch === "{") { depth++; }
+          else if (ch === "}") {
+            depth--;
+            if (depth === 0) {
+              const candidate = s.slice(i, j + 1);
+              try {
+                const obj = JSON.parse(candidate);
+                if (obj && typeof obj === "object" && !Array.isArray(obj)) best = obj;
+              } catch (_) { /* not valid JSON, keep scanning */ }
+              break;
+            }
+          }
+        }
+      }
+      return best;
+    }
+
+    // Defensive parse of the model's text -> listing object (or throw).
+    // Accepts either a single string, or the direct-API `content` array (mixed
+    // block types) — text blocks are concatenated first.
+    function parseResponse(input) {
+      let text;
+      if (Array.isArray(input)) {
+        // content array: keep only text blocks, in order.
+        text = input
+          .filter(function (b) { return b && b.type === "text" && typeof b.text === "string"; })
+          .map(function (b) { return b.text; })
+          .join("\n");
+      } else {
+        text = input;
+      }
+      if (typeof text !== "string" || !text.trim()) throw new Error("Empty response from AI.");
+      let s = text.trim();
+      // Strip ```json ... ``` or ``` ... ``` fences.
+      s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+
+      // Prefer the LAST balanced JSON object (robust to prose / multiple blocks);
+      // fall back to the first-{ to last-} slice for the simple single-object case.
+      let obj = extractLastJsonObject(s);
+      if (!obj) {
+        const start = s.indexOf("{");
+        const end = s.lastIndexOf("}");
+        if (start === -1 || end === -1 || end <= start) {
+          throw new Error("AI response wasn't JSON.");
+        }
+        try {
+          obj = JSON.parse(s.slice(start, end + 1));
+        } catch (e) {
+          throw new Error("Couldn't parse the AI's JSON.");
+        }
+      }
+      if (!obj || typeof obj !== "object") throw new Error("AI returned no listing.");
+      if (!obj.platforms || typeof obj.platforms !== "object") obj.platforms = {};
+      return obj;
+    }
+
+    async function generateBuiltin(payload) {
+      const text = await window.claude.complete(buildPrompt(payload, false));
+      return parseResponse(text);
+    }
+
+    /* ---- Direct Anthropic Messages API (SPE-19) ----
+       Browser CORS requires anthropic-dangerous-direct-browser-access: true.
+       Web search is server-executed; the response content array mixes block
+       types (server_tool_use, web_search_tool_result, text, empty thinking).
+       We handle pause_turn (server tool loop paused) by re-sending with the
+       assistant content appended, up to API_MAX_CONTINUATIONS times, and map
+       HTTP errors + stop_reasons to friendly messages. */
+
+    // Map a fetch/HTTP failure to a friendly, user-facing message.
+    function apiErrorMessage(status) {
+      if (status === 401) return "API key looks invalid — check it in Settings.";
+      if (status === 429) return "Rate limited — wait a minute and retry.";
+      if (status === 529 || (status >= 500 && status < 600)) return "Anthropic is busy — try again.";
+      return "The AI request failed (HTTP " + status + "). Try again.";
+    }
+
+    // One POST to /v1/messages with a 60s timeout. `body` is the full request
+    // object. Returns the parsed JSON response, or throws an Error whose message
+    // is already user-friendly.
+    async function apiRequest(key, body) {
+      const controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
+      let timer = null;
+      if (controller) timer = setTimeout(function () { controller.abort(); }, API_TIMEOUT_MS);
+      let res;
+      try {
+        res = await fetch(ANTHROPIC_API_URL, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "anthropic-dangerous-direct-browser-access": "true"
+          },
+          body: JSON.stringify(body),
+          signal: controller ? controller.signal : undefined
+        });
+      } catch (e) {
+        if (timer) clearTimeout(timer);
+        if (e && e.name === "AbortError") throw new Error("The AI request timed out. Try again.");
+        throw new Error("Couldn't reach Anthropic — check your connection and retry.");
+      }
+      if (timer) clearTimeout(timer);
+      if (!res.ok) {
+        throw new Error(apiErrorMessage(res.status));
+      }
+      try {
+        return await res.json();
+      } catch (e) {
+        throw new Error("The AI returned an unreadable response. Try again.");
+      }
+    }
+
+    async function generateApi(payload) {
+      const key = ApiKey.get();
+      if (!key) throw new Error("No API key configured. Add one in Settings.");
+
+      const messages = [{ role: "user", content: buildPrompt(payload, true) }];
+      let response = null;
+
+      for (let attempt = 0; attempt <= API_MAX_CONTINUATIONS; attempt++) {
+        response = await apiRequest(key, {
+          model: ANTHROPIC_MODEL,
+          max_tokens: 8000,
+          tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 4 }],
+          messages: messages
+        });
+
+        const stop = response && response.stop_reason;
+        if (stop === "pause_turn") {
+          // Server tool loop paused — re-send with the assistant content appended.
+          if (attempt >= API_MAX_CONTINUATIONS) {
+            throw new Error("The AI took too long researching prices. Try again.");
+          }
+          messages.push({ role: "assistant", content: response.content });
+          continue;
+        }
+        if (stop === "max_tokens") {
+          throw new Error("The AI response was cut off. Try again.");
+        }
+        if (stop === "refusal") {
+          throw new Error("The AI declined to generate this listing.");
+        }
+        // end_turn (or anything else terminal) — parse and return.
+        break;
+      }
+
+      if (!response || !Array.isArray(response.content)) {
+        throw new Error("The AI returned no listing. Try again.");
+      }
+      return parseResponse(response.content);
+    }
+
+    // Minimal real request used by the Settings "Test" button. Small, no tools,
+    // returns { ok:true } or { ok:false, message } with the mapped error text.
+    async function testKey(key) {
+      const k = (key == null ? "" : String(key)).trim();
+      if (!k) return { ok: false, message: "Enter an API key to test." };
+      try {
+        await apiRequest(k, {
+          model: ANTHROPIC_MODEL,
+          max_tokens: 32,
+          messages: [{ role: "user", content: "Reply with OK" }]
+        });
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: (e && e.message) ? e.message : "Test request failed." };
+      }
+    }
+
+    // ---- MOCK (dev only) — clearly labelled placeholder content. ----
+    function generateMock(payload) {
+      return new Promise(function (resolve) {
+        setTimeout(function () {
+          const brand = payload.brand || "Unbranded";
+          const cat = payload.category || "item";
+          const size = payload.size || "OS";
+          const condLabel = CONDITION_LABELS[payload.condition] || payload.condition || "Good";
+          const cost = Number(payload.costPaid) || 0;
+          // Naive mock price: 3x cost, floored at $12, rounded to .99
+          const price = Math.max(12, Math.round(cost * 3)) - 0.01;
+          const hashCat = cat.toLowerCase().replace(/[^a-z0-9]+/g, "");
+          const hashBrand = brand.toLowerCase().replace(/[^a-z0-9]+/g, "");
+          resolve({
+            title: brand + " " + cat + " — Size " + size + " (" + condLabel + ")",
+            description:
+              "[MOCK DRAFT] " + condLabel + " " + brand + " " + cat + " in size " + size + ". " +
+              "Great secondhand find, pictured as-is. Smoke-free. Bundle to save on shipping!",
+            suggestedPrice: price,
+            platforms: {
+              poshmark: "Size " + size + " " + brand + " " + cat + "! 💕 " + condLabel +
+                        " condition, so cute. Bundle & save! #" + hashBrand + " #" + hashCat + " #poshmark #thrifted",
+              ebay: brand + " " + cat + " Size " + size + " Women's " + condLabel +
+                    " — Fast Ship (Brand: " + brand + ", Size: " + size + ", Type: " + cat +
+                    ", Condition: " + condLabel + ")",
+              mercari: brand + " " + cat + ", size " + size + ", " + condLabel + " condition. Ships next day.",
+              depop: "*mock* " + brand.toLowerCase() + " " + cat.toLowerCase() + " size " + size.toLowerCase() +
+                     " ~ " + condLabel.toLowerCase() + " condition, dm for bundles #" + hashBrand + " #" +
+                     hashCat + " #vintage #y2k #thrifted"
+            }
+          });
+        }, 900);
+      });
+    }
+
+    async function generate(payload) {
+      const m = mode();
+      if (m === "builtin") return generateBuiltin(payload);
+      if (m === "api") return generateApi(payload);
+      return generateMock(payload);
+    }
+
+    return {
+      isLive: isLive, mode: mode, generate: generate,
+      buildPrompt: buildPrompt, parseResponse: parseResponse,
+      testKey: testKey
+    };
+  })();
+
+  // Human-readable label for the active AI mode (shown in Settings + loading copy).
+  function aiModeLabel() {
+    switch (AIListing.mode()) {
+      case "builtin": return "Claude (built-in)";
+      case "api":     return "Claude API (your key)";
+      default:        return "Demo mode";
+    }
+  }
+
+  /* ===========================================================================
+     [SETTINGS]  — SPE-19. Modal overlay: API key management, connection test,
+     AI mode indicator, and data backup / restore.
+     ---------------------------------------------------------------------------
+     - API key stored via ApiKey (separate storage key; never in exports).
+     - Export: full store (items + bundles + schemaVersion) as a JSON download.
+       Includes photo dataURLs (that's the point of a backup). NEVER the key.
+     - Import: validate shape defensively, confirm (REPLACES data), load + persist.
+     Transient UI scratch lives in settingsState (not persisted).
+     =========================================================================== */
+  const settingsState = {
+    open: false,
+    keyInput: "",           // working value of the key field
+    feedback: null,         // { kind:'ok'|'err'|'info', msg } test/import result
+    confirmImport: null     // { data } parsed import awaiting confirmation
+  };
+
+  function openSettings() {
+    settingsState.open = true;
+    settingsState.keyInput = "";
+    settingsState.feedback = null;
+    settingsState.confirmImport = null;
+    renderSettings();
+  }
+  function closeSettings() {
+    settingsState.open = false;
+    const host = document.getElementById("settingsModal");
+    if (host) host.remove();
+  }
+
+  function settingsModalHTML() {
+    const has = ApiKey.has();
+    const modeKey = AIListing.mode();
+    const fb = settingsState.feedback;
+
+    // ---- AI mode indicator ----
+    const modeCard =
+      '<div class="card">' +
+        '<div class="section-label">AI listing generation</div>' +
+        '<span class="mode-indicator ' + modeKey + '"><span class="dot"></span>' +
+          escapeHtml(aiModeLabel()) + '</span>' +
+        '<div class="privacy-note">' +
+          (modeKey === "builtin"
+            ? "Running inside the Claude app — listings use Claude with live price research, no key needed."
+            : modeKey === "api"
+              ? "Using your Anthropic API key with web-search price research."
+              : "No AI available — the app generates clearly-labelled demo drafts. Add an API key below to enable real listings.") +
+        '</div>' +
+      '</div>';
+
+    // ---- API key management ----
+    const savedRow = has
+      ? '<div class="key-saved-row">' +
+          '<span class="masked">' + escapeHtml(ApiKey.masked()) + '</span>' +
+          '<button class="btn danger-ghost tiny" type="button" data-act="clear-key">Clear</button>' +
+        '</div>'
+      : '';
+
+    const keyCard =
+      '<div class="card">' +
+        '<div class="section-label">Anthropic API key</div>' +
+        savedRow +
+        '<div class="field">' +
+          '<label>' + (has ? "Replace key" : "Paste your key") + '</label>' +
+          '<input id="apiKeyInput" type="password" autocomplete="off" autocapitalize="none" ' +
+            'autocorrect="off" spellcheck="false" placeholder="sk-ant-…" ' +
+            'value="' + escapeHtml(settingsState.keyInput) + '" />' +
+        '</div>' +
+        '<div class="settings-btn-row">' +
+          '<button class="btn" type="button" data-act="save-key">Save</button>' +
+          '<button class="btn secondary" type="button" data-act="test-key">Test</button>' +
+        '</div>' +
+        (fb ? '<p class="settings-feedback ' + fb.kind + '">' + escapeHtml(fb.msg) + '</p>' : '') +
+        '<p class="privacy-note">Your key is stored only on this device. It is never included in data exports.</p>' +
+      '</div>';
+
+    // ---- Backup / restore ----
+    let importBlock;
+    if (settingsState.confirmImport) {
+      const d = settingsState.confirmImport.data;
+      const nItems = (d.items || []).length;
+      const nBundles = (d.bundles || []).length;
+      importBlock =
+        '<div class="confirm-box">' +
+          '<p>Replace ALL current data with this backup? ' +
+            'This imports ' + nItems + ' item' + (nItems === 1 ? "" : "s") + ' and ' +
+            nBundles + ' bundle' + (nBundles === 1 ? "" : "s") + ', ' +
+            'and permanently discards what’s currently in the app.</p>' +
+          '<div class="row">' +
+            '<button class="btn danger" type="button" data-act="import-confirm" style="flex:1;">Replace data</button>' +
+            '<button class="btn secondary" type="button" data-act="import-cancel" style="flex:1;">Cancel</button>' +
+          '</div>' +
+        '</div>';
+    } else {
+      importBlock =
+        '<button class="btn secondary" type="button" data-act="import" style="margin-top:10px;">Import data&hellip;</button>' +
+        '<input id="importFileInput" class="visually-hidden" type="file" accept="application/json,.json" />';
+    }
+
+    const backupCard =
+      '<div class="card">' +
+        '<div class="section-label">Backup &amp; restore</div>' +
+        '<p class="muted" style="margin-top:0;">Export a full copy of your items, bundles, and photos as a JSON file. Import replaces everything currently in the app.</p>' +
+        '<button class="btn" type="button" data-act="export">Export data</button>' +
+        importBlock +
+      '</div>';
+
+    return '' +
+      '<div class="modal-overlay" id="settingsModal">' +
+        '<div class="modal-sheet" role="dialog" aria-label="Settings">' +
+          '<div class="modal-head">' +
+            '<h2>Settings</h2>' +
+            '<button class="modal-close" type="button" data-act="close" aria-label="Close">&times;</button>' +
+          '</div>' +
+          '<div class="modal-body">' +
+            modeCard + keyCard + backupCard +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function renderSettings() {
+    // Remove any existing modal, then (if open) mount a fresh one.
+    const existing = document.getElementById("settingsModal");
+    if (existing) existing.remove();
+    if (!settingsState.open) return;
+
+    document.body.insertAdjacentHTML("beforeend", settingsModalHTML());
+    // Trigger the enter transition.
+    const overlay = document.getElementById("settingsModal");
+    if (overlay) { void overlay.offsetWidth; overlay.classList.add("show"); }
+    wireSettings();
+  }
+
+  function wireSettings() {
+    const host = document.getElementById("settingsModal");
+    if (!host) return;
+
+    // Close when tapping the backdrop (but not the sheet).
+    host.addEventListener("click", function (e) {
+      if (e.target === host) closeSettings();
+    });
+
+    // Keep the key field value in scratch across re-renders.
+    const keyInput = document.getElementById("apiKeyInput");
+    if (keyInput) keyInput.addEventListener("input", function () {
+      settingsState.keyInput = keyInput.value;
+    });
+
+    host.querySelectorAll("[data-act]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        const act = btn.getAttribute("data-act");
+        if (act === "close") { closeSettings(); }
+        else if (act === "save-key") { onSaveKey(); }
+        else if (act === "clear-key") { onClearKey(); }
+        else if (act === "test-key") { onTestKey(btn); }
+        else if (act === "export") { onExportData(); }
+        else if (act === "import") { triggerImportPicker(); }
+        else if (act === "import-confirm") { onImportConfirm(); }
+        else if (act === "import-cancel") { settingsState.confirmImport = null; renderSettings(); }
+      });
+    });
+
+    // Import file picker.
+    const fileInput = document.getElementById("importFileInput");
+    const importBtn = host.querySelector('[data-act="import"]');
+    if (importBtn && fileInput) {
+      // (button click is handled above via triggerImportPicker)
+      fileInput.addEventListener("change", onImportFileChosen);
+    }
+  }
+
+  function setSettingsFeedback(kind, msg) {
+    settingsState.feedback = { kind: kind, msg: msg };
+    renderSettings();
+  }
+
+  async function onSaveKey() {
+    const val = (settingsState.keyInput || "").trim();
+    if (!val) { setSettingsFeedback("err", "Enter an API key to save."); return; }
+    await ApiKey.set(val);
+    settingsState.keyInput = "";
+    setSettingsFeedback("ok", "Key saved on this device.");
+  }
+
+  async function onClearKey() {
+    await ApiKey.clear();
+    settingsState.keyInput = "";
+    setSettingsFeedback("info", "Key cleared.");
+  }
+
+  async function onTestKey(btn) {
+    // Test the field value if present, else the saved key.
+    const candidate = (settingsState.keyInput || "").trim() || ApiKey.get() || "";
+    settingsState.feedback = { kind: "info", msg: "Testing connection…" };
+    renderSettings();
+    // Disable the just-rendered Test button while in flight.
+    const testBtn = document.querySelector('#settingsModal [data-act="test-key"]');
+    if (testBtn) testBtn.setAttribute("disabled", "");
+    const res = await AIListing.testKey(candidate);
+    if (res.ok) setSettingsFeedback("ok", "Success — the API key works.");
+    else setSettingsFeedback("err", res.message || "Test failed.");
+  }
+
+  /* ---------------------- Export (SPE-19 / Task 3) ---------------------- */
+  function onExportData() {
+    // Serialize the full store — items + bundles + schemaVersion — NEVER the key.
+    const state = AppStore.getState();
+    const payload = {
+      schemaVersion: state.schemaVersion || SCHEMA_VERSION,
+      items: state.items || [],
+      bundles: state.bundles || []
+    };
+    let json;
+    try {
+      json = JSON.stringify(payload, null, 2);
+    } catch (e) {
+      setSettingsFeedback("err", "Couldn't prepare the backup.");
+      return;
+    }
+    const d = new Date();
+    const p = function (n) { return String(n).padStart(2, "0"); };
+    const name = "thrift-ledger-backup-" + d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + ".json";
+    try {
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Revoke shortly after so iOS has time to open the share sheet.
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+      setSettingsFeedback("ok", "Backup ready: " + name);
+    } catch (e) {
+      setSettingsFeedback("err", "Export failed on this device.");
+    }
+  }
+
+  /* ---------------------- Import (SPE-19 / Task 3) ---------------------- */
+  function triggerImportPicker() {
+    const fileInput = document.getElementById("importFileInput");
+    if (fileInput) fileInput.click();
+  }
+
+  // Defensive shape check: needs a schemaVersion and an items ARRAY.
+  function isValidBackup(obj) {
+    return obj && typeof obj === "object" &&
+      (typeof obj.schemaVersion === "number") &&
+      Array.isArray(obj.items) &&
+      (obj.bundles == null || Array.isArray(obj.bundles));
+  }
+
+  function onImportFileChosen(e) {
+    const file = e.target.files && e.target.files[0];
+    // Reset the input so re-choosing the same file re-fires change.
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onerror = function () {
+      setSettingsFeedback("err", "Couldn't read that file.");
+    };
+    reader.onload = function () {
+      let parsed;
+      try {
+        parsed = JSON.parse(String(reader.result));
+      } catch (err) {
+        setSettingsFeedback("err", "That file isn't valid JSON. No data was changed.");
+        return;
+      }
+      if (!isValidBackup(parsed)) {
+        setSettingsFeedback("err", "That doesn't look like a Thrift Ledger backup. No data was changed.");
+        return;
+      }
+      settingsState.confirmImport = { data: parsed };
+      settingsState.feedback = null;
+      renderSettings();
+    };
+    reader.readAsText(file);
+  }
+
+  async function onImportConfirm() {
+    const ci = settingsState.confirmImport;
+    if (!ci || !isValidBackup(ci.data)) { settingsState.confirmImport = null; renderSettings(); return; }
+    settingsState.confirmImport = null;
+    const ok = await AppStore.replaceAll(ci.data);
+    if (ok) setSettingsFeedback("ok", "Backup restored.");
+    else setSettingsFeedback("err", "Import failed — your data is unchanged.");
+  }
+
+  /* ===========================================================================
+     [VIEWS]  — one render fn per tab. Read ONLY through AppStore.
+     Later phases replace the placeholder bodies; keep the render signatures.
+     =========================================================================== */
+
+  function money(n) { return "$" + (Number(n) || 0).toFixed(2); }
+  // Signed money for profit ("+$4.00" / "-$2.50"). 0 renders as "$0.00".
+  function moneySigned(n) {
+    const v = Number(n) || 0;
+    const sign = v > 0 ? "+" : (v < 0 ? "-" : "");
+    return sign + "$" + Math.abs(v).toFixed(2);
+  }
+
+  /* ===========================================================================
+     [SALES MATH]  — SPE-12/13/14. Single source of truth for profit math.
+     All formulas follow the documented invariants I1..I5 exactly.
+     ---------------------------------------------------------------------------
+     I5: single-sale profit = sale.price - costPaid - sale.fee
+         bundle profit      = bundle.totalPrice - Σ costPaid(items) - bundle.fee
+     A "single sale" is a sold item whose sale.bundleId is null. Bundled items
+     carry sale.price = 0 and sale.fee = 0 (revenue/fee live on the Bundle, I4),
+     so they are NEVER counted individually — only via their Bundle.
+     =========================================================================== */
+  const Sales = (function () {
+    function num(n) { return Number(n) || 0; }
+
+    // A sold, non-bundled item.
+    function isSingleSale(i) {
+      return i && i.status === STATUS.SOLD && i.sale && i.sale.bundleId == null;
+    }
+    function singleProfit(i) {
+      return num(i.sale.price) - num(i.costPaid) - num(i.sale.fee);
+    }
+    // Items belonging to a bundle (resolved from the bundle's itemIds).
+    function bundleItems(bundle) {
+      return (bundle.itemIds || []).map(function (id) { return AppStore.getItem(id); })
+        .filter(Boolean);
+    }
+    function bundleCost(bundle) {
+      return bundleItems(bundle).reduce(function (s, it) { return s + num(it.costPaid); }, 0);
+    }
+    function bundleProfit(bundle) {
+      return num(bundle.totalPrice) - bundleCost(bundle) - num(bundle.fee);
+    }
+
+    // ---- Dashboard aggregates (SPE-14) ----
+    function summary() {
+      const items = AppStore.listItems();       // ALL items
+      const bundles = AppStore.listBundles();
+
+      // Total spend: costPaid of EVERY item, any status (I1/I2).
+      const totalSpent = items.reduce(function (s, i) { return s + num(i.costPaid); }, 0);
+
+      const singles = items.filter(isSingleSale);
+
+      // Revenue = Σ single-sale prices + Σ bundle totalPrices.
+      const singleRevenue = singles.reduce(function (s, i) { return s + num(i.sale.price); }, 0);
+      const bundleRevenue = bundles.reduce(function (s, b) { return s + num(b.totalPrice); }, 0);
+      const revenue = singleRevenue + bundleRevenue;
+
+      // Fees = Σ single-sale fees + Σ bundle fees.
+      const singleFees = singles.reduce(function (s, i) { return s + num(i.sale.fee); }, 0);
+      const bundleFees = bundles.reduce(function (s, b) { return s + num(b.fee); }, 0);
+      const fees = singleFees + bundleFees;
+
+      // Net profit = Σ profit of each sale/bundle. This equals
+      // revenue - fees - (cost of SOLD items only). We do NOT subtract the cost
+      // of unsold inventory here.
+      const singleProfitTotal = singles.reduce(function (s, i) { return s + singleProfit(i); }, 0);
+      const bundleProfitTotal = bundles.reduce(function (s, b) { return s + bundleProfit(b); }, 0);
+      const netProfit = singleProfitTotal + bundleProfitTotal;
+
+      // Cost of sold items (for the transparency line): revenue - fees - profit.
+      const costOfSold = revenue - fees - netProfit;
+      // Unsold inventory cost = total spent - cost of sold items.
+      const unsoldCost = totalSpent - costOfSold;
+
+      // Status counts.
+      const counts = { draft: 0, listed: 0, sold: 0, "not-listing": 0 };
+      items.forEach(function (i) { if (counts[i.status] != null) counts[i.status]++; });
+
+      return {
+        totalSpent: totalSpent,
+        revenue: revenue,
+        fees: fees,
+        netProfit: netProfit,
+        costOfSold: costOfSold,
+        unsoldCost: unsoldCost,
+        counts: counts,
+        soldCount: singles.length,   // sold ITEMS via single sales
+        bundleCount: bundles.length
+      };
+    }
+
+    // ---- Recent sales feed (SPE-14): single sales + bundles, newest first ----
+    // Each entry: { kind:'single'|'bundle', date, ...refs }.
+    function recentSales() {
+      const out = [];
+      AppStore.listItems().filter(isSingleSale).forEach(function (i) {
+        out.push({ kind: "single", date: (i.sale && i.sale.date) || i.createdAt, item: i });
+      });
+      AppStore.listBundles().forEach(function (b) {
+        out.push({ kind: "bundle", date: b.date, bundle: b });
+      });
+      out.sort(function (a, b) { return b.date - a.date; });
+      return out;
+    }
+
+    return {
+      isSingleSale: isSingleSale, singleProfit: singleProfit,
+      bundleItems: bundleItems, bundleCost: bundleCost, bundleProfit: bundleProfit,
+      summary: summary, recentSales: recentSales
+    };
+  })();
+
+  // Format an epoch-ms date as a short, friendly label (e.g. "Jul 4, 2026").
+  function formatSaleDate(ms) {
+    const d = new Date(Number(ms) || Date.now());
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  }
+  // Today as a yyyy-mm-dd string for <input type="date"> defaults.
+  function todayInputValue() {
+    const d = new Date();
+    const p = function (n) { return String(n).padStart(2, "0"); };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+  }
+  // Parse a yyyy-mm-dd input value into epoch ms (local midnight). Falls back to now.
+  function dateInputToMs(val) {
+    if (!val) return Date.now();
+    const parts = String(val).split("-");
+    if (parts.length !== 3) return Date.now();
+    const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    return isNaN(d.getTime()) ? Date.now() : d.getTime();
+  }
+
+  /* ===========================================================================
+     [ADD FLOW]  — SPE-6 (intake) / SPE-7 (AI listing) / SPE-8 (edit) / SPE-9 (links)
+     ---------------------------------------------------------------------------
+     The Add Item tab is a small step machine rendered into #addFlow by
+     renderAdd(). Steps:
+       'intake'  - photo + fields form (SPE-6)
+       'loading' - generating listing via Claude / mock (SPE-7)
+       'error'   - generation failed; retry or fill manually (SPE-7)
+       'review'  - editable listing + per-platform copy/go buttons (SPE-8/9)
+       'done'    - saved confirmation
+
+     All transient step state lives in `addState` (NOT in AppStore — it's UI
+     scratch, not persisted). The item itself is created in AppStore as a
+     'draft' the moment intake is saved, then patched to 'listed' on save.
+     =========================================================================== */
+  const addState = {
+    step: "intake",
+    // intake form working values
+    form: null,          // { photo, category, categoryOther, brand, size, condition, costPaid }
+    error: "",           // validation error text
+    // the draft Item id once created in the store
+    itemId: null,
+    // AI/mock draft being reviewed+edited (a listing-shaped object)
+    draft: null,
+    genError: ""         // generation error text
+  };
+
+  function freshForm() {
+    return { photo: null, category: "", categoryOther: "", brand: "", size: "", condition: "", costPaid: "" };
+  }
+
+  function renderAdd() {
+    const host = document.getElementById("addFlow");
+    if (!host) return;
+    if (!addState.form) addState.form = freshForm();
+
+    switch (addState.step) {
+      case "loading": host.innerHTML = addFlowLoadingHTML(); break;
+      case "error":   host.innerHTML = addFlowGenErrorHTML(); break;
+      case "review":  host.innerHTML = addFlowReviewHTML(); break;
+      case "done":    host.innerHTML = addFlowDoneHTML(); break;
+      case "intake":
+      default:        host.innerHTML = addFlowIntakeHTML(); break;
+    }
+    wireAddFlow();
+  }
+
+  /* ---------------------- STEP: intake (SPE-6) ---------------------- */
+  function addFlowIntakeHTML() {
+    const f = addState.form;
+    const err = addState.error;
+
+    const photoInner = f.photo
+      ? '<img class="thumb" src="' + f.photo + '" alt="Item photo preview" />' +
+        '<div class="photo-actions">' +
+          '<button class="btn secondary" type="button" data-act="retake">Retake</button>' +
+          '<button class="btn secondary" type="button" data-act="picklibrary">Library</button>' +
+          '<button class="btn ghost" type="button" data-act="removephoto">Remove</button>' +
+        '</div>'
+      : '<div class="photo-zone empty" data-act="pickphoto">' +
+          '<span class="emoji">&#128247;</span>' +
+          'Tap to take a photo' +
+          '<div class="hint">Opens the camera &middot; compressed on device</div>' +
+        '</div>' +
+        '<button class="btn ghost library-link" type="button" data-act="picklibrary">or choose from photo library</button>';
+
+    const catOpts = ['<option value="">Select a category&hellip;</option>']
+      .concat(CATEGORY_OPTIONS.map(function (c) {
+        return '<option value="' + escapeHtml(c) + '"' + (f.category === c ? " selected" : "") + '>' + escapeHtml(c) + '</option>';
+      }))
+      .concat('<option value="__other"' + (f.category === "__other" ? " selected" : "") + '>Other&hellip;</option>')
+      .join("");
+
+    const condOpts = ['<option value="">Select&hellip;</option>']
+      .concat(CONDITION_OPTIONS.map(function (c) {
+        var label = c === "NWT" ? "NWT (New With Tags)" : c;
+        return '<option value="' + escapeHtml(c) + '"' + (f.condition === c ? " selected" : "") + '>' + escapeHtml(label) + '</option>';
+      })).join("");
+
+    return '' +
+      '<div class="card">' +
+        '<h2>New Item</h2>' +
+        '<p class="muted">Snap a photo, add the details, and let AI draft the listing.</p>' +
+      '</div>' +
+      '<form id="intakeForm" class="card" onsubmit="return false;">' +
+        '<div class="field">' +
+          '<label>Photo</label>' +
+          '<div class="photo-zone' + (f.photo ? "" : " empty-wrap") + '">' + photoInner + '</div>' +
+          '<input id="photoInput" class="visually-hidden" type="file" accept="image/*" capture="environment" />' +
+          '<input id="photoLibraryInput" class="visually-hidden" type="file" accept="image/*" />' +
+        '</div>' +
+        '<div class="field' + (err && err.field === "category" ? " invalid" : "") + '">' +
+          '<label>Category</label>' +
+          '<select id="f-category">' + catOpts + '</select>' +
+        '</div>' +
+        (f.category === "__other"
+          ? '<div class="field"><label>Category (custom)</label>' +
+            '<input id="f-category-other" value="' + escapeHtml(f.categoryOther) + '" placeholder="e.g. Scarf" /></div>'
+          : "") +
+        '<div class="field' + (err && err.field === "brand" ? " invalid" : "") + '">' +
+          '<label>Brand</label>' +
+          '<input id="f-brand" value="' + escapeHtml(f.brand) + '" placeholder="e.g. Zara" />' +
+        '</div>' +
+        '<div class="row">' +
+          '<div class="field"><label>Size</label>' +
+            '<input id="f-size" value="' + escapeHtml(f.size) + '" placeholder="e.g. M" /></div>' +
+          '<div class="field"><label>Condition</label>' +
+            '<select id="f-condition">' + condOpts + '</select></div>' +
+        '</div>' +
+        '<div class="field' + (err && err.field === "cost" ? " invalid" : "") + '">' +
+          '<label>Cost paid (USD)</label>' +
+          '<div class="price-input-wrap"><span class="dollar">$</span>' +
+          '<input id="f-cost" type="number" inputmode="decimal" step="0.01" min="0" ' +
+            'value="' + escapeHtml(f.costPaid) + '" placeholder="0.00" /></div>' +
+        '</div>' +
+        (err ? '<div class="form-error">' + escapeHtml(err.msg) + '</div>' : "") +
+        '<button class="btn" id="genListingBtn" type="button">Generate listing &rarr;</button>' +
+        '<button class="btn secondary" id="saveNoListingBtn" type="button" style="margin-top:10px;">Save without listing</button>' +
+      '</form>';
+  }
+
+  /* ---------------------- STEP: loading (SPE-7) ---------------------- */
+  function addFlowLoadingHTML() {
+    const m = AIListing.mode();
+    const heading = m === "api" ? "Researching prices&hellip;" : "Drafting the listing&hellip;";
+    const sub = m === "api"    ? "Searching Poshmark, eBay, Mercari &amp; Depop for comparables. This can take up to a minute."
+              : m === "builtin" ? "Researching comparable resale prices."
+              : "Using local mock generator (Demo mode).";
+    return '' +
+      '<div class="card">' + itemStripHTML() + '</div>' +
+      '<div class="card"><div class="loading-block">' +
+        '<div class="spinner"></div>' +
+        '<div style="font-weight:650;">' + heading + '</div>' +
+        '<div class="muted" style="margin-top:6px;">' + sub + '</div>' +
+      '</div></div>';
+  }
+
+  /* ---------------------- STEP: generation error (SPE-7) ---------------------- */
+  function addFlowGenErrorHTML() {
+    return '' +
+      '<div class="card">' + itemStripHTML() + '</div>' +
+      '<div class="card">' +
+        '<h2>Couldn’t generate a listing</h2>' +
+        '<p class="muted">' + escapeHtml(addState.genError || "Something went wrong.") + '</p>' +
+        '<button class="btn" id="retryGenBtn" type="button">Retry</button>' +
+        '<button class="btn secondary" id="manualFillBtn" type="button" style="margin-top:10px;">Fill in manually</button>' +
+      '</div>';
+  }
+
+  /* ---------------------- STEP: review + edit (SPE-8/9) ---------------------- */
+  function addFlowReviewHTML() {
+    const d = addState.draft || AppStore.makeListing();
+    const platformBlocks = PLATFORMS.map(function (p) {
+      return '' +
+        '<div class="platform-block" data-platform="' + p + '">' +
+          '<div class="phead">' +
+            '<span class="pname"><span class="pdot ' + p + '"></span>' + escapeHtml(PLATFORM_LABELS[p]) + '</span>' +
+            '<div class="pactions">' +
+              '<button class="btn secondary" type="button" data-copy="' + p + '">Copy</button>' +
+              '<button class="btn ghost" type="button" data-go="' + p + '">Go to ' + escapeHtml(PLATFORM_LABELS[p]) + '</button>' +
+            '</div>' +
+          '</div>' +
+          '<textarea data-field="platform" data-platform-field="' + p + '">' + escapeHtml(d.platforms[p] || "") + '</textarea>' +
+        '</div>';
+    }).join("");
+
+    return '' +
+      '<div class="card">' + itemStripHTML() + '</div>' +
+      '<div class="card">' +
+        '<div class="section-label">Listing draft &middot; everything editable</div>' +
+        '<div class="field"><label>Title</label>' +
+          '<input data-field="title" value="' + escapeHtml(d.title || "") + '" /></div>' +
+        '<div class="field"><label>Description</label>' +
+          '<textarea data-field="description" style="min-height:110px;">' + escapeHtml(d.description || "") + '</textarea></div>' +
+        '<div class="field"><label>Suggested price (USD)</label>' +
+          '<div class="price-input-wrap"><span class="dollar">$</span>' +
+          '<input data-field="suggestedPrice" type="number" inputmode="decimal" step="0.01" min="0" ' +
+            'value="' + escapeHtml(numOrEmpty(d.suggestedPrice)) + '" /></div></div>' +
+      '</div>' +
+      '<div class="card">' +
+        '<div class="section-label">Per-platform text</div>' +
+        platformBlocks +
+      '</div>' +
+      '<button class="btn" id="saveListingBtn" type="button">Save listing</button>' +
+      '<button class="btn secondary" id="regenBtn" type="button" style="margin-top:10px;">Regenerate</button>' +
+      '<button class="btn ghost" id="discardListingBtn" type="button" style="margin-top:10px;">Discard &amp; start over</button>';
+  }
+
+  /* ---------------------- STEP: done ---------------------- */
+  function addFlowDoneHTML() {
+    return '' +
+      '<div class="card">' +
+        '<div class="placeholder" style="padding:30px 16px;">' +
+          '<span class="emoji">&#9989;</span>' +
+          '<div style="font-weight:650;color:var(--ink);">Item saved &amp; listed</div>' +
+          '<div class="muted" style="margin-top:6px;">It’s in your inventory now.</div>' +
+        '</div>' +
+        '<button class="btn" id="addAnotherBtn" type="button">Add another item</button>' +
+        '<button class="btn secondary" id="viewInventoryBtn" type="button" style="margin-top:10px;">View inventory</button>' +
+      '</div>';
+  }
+
+  // Small item summary used across generate/review steps.
+  function itemStripHTML() {
+    const f = addState.form || freshForm();
+    const cat = f.category === "__other" ? f.categoryOther : f.category;
+    const title = [f.brand, cat].filter(Boolean).join(" ") || "New item";
+    const bits = [f.size ? "Size " + f.size : "", f.condition ? CONDITION_LABELS[f.condition] || f.condition : "",
+                  "Cost " + money(parseFloat(f.costPaid) || 0)].filter(Boolean).join(" · ");
+    const img = f.photo
+      ? '<img src="' + f.photo + '" alt="" />'
+      : '<img alt="" style="display:flex;align-items:center;justify-content:center;font-size:20px;" />';
+    return '<div class="item-strip">' + img +
+      '<div class="meta"><div class="t">' + escapeHtml(title) + '</div>' +
+      '<div class="s">' + escapeHtml(bits) + '</div></div></div>';
+  }
+
+  function numOrEmpty(n) {
+    if (n == null || n === "" || isNaN(Number(n))) return "";
+    return String(Number(n));
+  }
+
+  /* ---------------------- event wiring for the current step ---------------------- */
+  function wireAddFlow() {
+    const host = document.getElementById("addFlow");
+    if (!host) return;
+
+    // Persist form field edits back into addState on input (so re-renders keep them).
+    function bindInput(id, key) {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener("input", function () { addState.form[key] = el.value; });
+    }
+
+    if (addState.step === "intake") {
+      // Photo picking
+      const photoInput = document.getElementById("photoInput");
+      const libraryInput = document.getElementById("photoLibraryInput");
+      const zone = host.querySelector('[data-act="pickphoto"]');
+      if (zone && photoInput) zone.addEventListener("click", function () { photoInput.click(); });
+      const retake = host.querySelector('[data-act="retake"]');
+      if (retake && photoInput) retake.addEventListener("click", function () { photoInput.click(); });
+      host.querySelectorAll('[data-act="picklibrary"]').forEach(function (btn) {
+        if (libraryInput) btn.addEventListener("click", function () { libraryInput.click(); });
+      });
+      const removeP = host.querySelector('[data-act="removephoto"]');
+      if (removeP) removeP.addEventListener("click", function () {
+        addState.form.photo = null; renderAdd();
+      });
+      if (photoInput) photoInput.addEventListener("change", onPhotoChosen);
+      if (libraryInput) libraryInput.addEventListener("change", onPhotoChosen);
+
+      // Text fields
+      bindInput("f-brand", "brand");
+      bindInput("f-size", "size");
+      bindInput("f-cost", "costPaid");
+      bindInput("f-category-other", "categoryOther");
+      const cat = document.getElementById("f-category");
+      if (cat) cat.addEventListener("change", function () {
+        addState.form.category = cat.value;
+        renderAdd(); // re-render to show/hide the custom field
+      });
+      const cond = document.getElementById("f-condition");
+      if (cond) cond.addEventListener("change", function () { addState.form.condition = cond.value; });
+
+      const genBtn = document.getElementById("genListingBtn");
+      if (genBtn) genBtn.addEventListener("click", onGenerateListing);
+      const saveNo = document.getElementById("saveNoListingBtn");
+      if (saveNo) saveNo.addEventListener("click", onSaveWithoutListing);
+    }
+
+    if (addState.step === "error") {
+      const retry = document.getElementById("retryGenBtn");
+      if (retry) retry.addEventListener("click", onGenerateListing);
+      const manual = document.getElementById("manualFillBtn");
+      if (manual) manual.addEventListener("click", function () {
+        // Provide an empty draft so she can fill it herself (SPE-7 fallback path).
+        addState.draft = AppStore.makeListing({ suggestedPrice: "" });
+        addState.step = "review";
+        renderAdd();
+      });
+    }
+
+    if (addState.step === "review") {
+      // Live-bind every editable field back into addState.draft (SPE-8).
+      host.querySelectorAll("[data-field]").forEach(function (el) {
+        el.addEventListener("input", function () {
+          const field = el.getAttribute("data-field");
+          if (field === "platform") {
+            addState.draft.platforms[el.getAttribute("data-platform-field")] = el.value;
+          } else if (field === "suggestedPrice") {
+            addState.draft.suggestedPrice = el.value; // parsed on save
+          } else {
+            addState.draft[field] = el.value;
+          }
+        });
+      });
+      // Copy buttons (SPE-8)
+      host.querySelectorAll("[data-copy]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const p = btn.getAttribute("data-copy");
+          copyText(addState.draft.platforms[p] || "", btn);
+        });
+      });
+      // Go-to-platform buttons (SPE-9)
+      host.querySelectorAll("[data-go]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const p = btn.getAttribute("data-go");
+          const url = PLATFORM_URLS[p];
+          if (url) window.open(url, "_blank", "noopener");
+        });
+      });
+      const saveBtn = document.getElementById("saveListingBtn");
+      if (saveBtn) saveBtn.addEventListener("click", onSaveListing);
+      const regen = document.getElementById("regenBtn");
+      if (regen) regen.addEventListener("click", onGenerateListing);
+      const discard = document.getElementById("discardListingBtn");
+      if (discard) discard.addEventListener("click", onDiscardFlow);
+    }
+
+    if (addState.step === "done") {
+      const again = document.getElementById("addAnotherBtn");
+      if (again) again.addEventListener("click", function () { resetAddFlow(); renderAdd(); });
+      const inv = document.getElementById("viewInventoryBtn");
+      if (inv) inv.addEventListener("click", function () { resetAddFlow(); Router.go("inventory"); });
+    }
+  }
+
+  /* ---------------------- intake actions (SPE-6) ---------------------- */
+  async function onPhotoChosen(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+      addState.form.photo = await compressImage(file, PHOTO_MAX_EDGE, PHOTO_QUALITY);
+    } catch (err) {
+      console.error("[photo] compression failed:", err);
+      addState.error = { field: "photo", msg: "Couldn't read that image. Try another." };
+    }
+    renderAdd();
+  }
+
+  // Read a File, draw to canvas capped at maxEdge, export JPEG dataURL.
+  function compressImage(file, maxEdge, quality) {
+    return new Promise(function (resolve, reject) {
+      const reader = new FileReader();
+      reader.onerror = function () { reject(new Error("read error")); };
+      reader.onload = function () {
+        const img = new Image();
+        img.onerror = function () { reject(new Error("decode error")); };
+        img.onload = function () {
+          let w = img.naturalWidth || img.width;
+          let h = img.naturalHeight || img.height;
+          if (!w || !h) { reject(new Error("bad dimensions")); return; }
+          const scale = Math.min(1, maxEdge / Math.max(w, h));
+          const cw = Math.max(1, Math.round(w * scale));
+          const ch = Math.max(1, Math.round(h * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = cw; canvas.height = ch;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, cw, ch);
+          try {
+            resolve(canvas.toDataURL("image/jpeg", quality));
+          } catch (err) { reject(err); }
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // Validate + build the item payload from the intake form.
+  // Returns { ok:true, payload } or { ok:false, error:{field,msg} }.
+  function readIntake() {
+    const f = addState.form;
+    const category = (f.category === "__other" ? f.categoryOther : f.category).trim();
+    const brand = (f.brand || "").trim();
+    const costRaw = String(f.costPaid).trim();
+    const cost = parseFloat(costRaw);
+
+    if (costRaw === "" || isNaN(cost) || cost < 0) {
+      return { ok: false, error: { field: "cost", msg: "Cost paid is required (0 or more)." } };
+    }
+    if (!category && !brand) {
+      return { ok: false, error: { field: "category", msg: "Enter at least a category or a brand." } };
+    }
+    return {
+      ok: true,
+      payload: {
+        photo: f.photo || null,
+        category: category,
+        brand: brand,
+        size: (f.size || "").trim(),
+        condition: f.condition || "",
+        costPaid: cost
+      }
+    };
+  }
+
+  // Ensure a draft Item exists in the store for the current intake; returns id.
+  function ensureDraftItem(payload) {
+    if (addState.itemId && AppStore.getItem(addState.itemId)) {
+      AppStore.updateItem(addState.itemId, payload);
+      return addState.itemId;
+    }
+    const item = AppStore.addItem(Object.assign({ status: STATUS.DRAFT }, payload));
+    addState.itemId = item.id;
+    return item.id;
+  }
+
+  function onSaveWithoutListing() {
+    const res = readIntake();
+    if (!res.ok) { addState.error = res.error; renderAdd(); return; }
+    addState.error = "";
+    withoutAddRerender(function () { ensureDraftItem(res.payload); }); // stays 'draft', no listing
+    addState.step = "done";
+    renderAdd();
+  }
+
+  async function onGenerateListing() {
+    const res = readIntake();
+    if (!res.ok) { addState.error = res.error; addState.step = "intake"; renderAdd(); return; }
+    addState.error = "";
+    withoutAddRerender(function () { ensureDraftItem(res.payload); }); // create/refresh the draft item
+
+    addState.step = "loading";
+    addState.genError = "";
+    renderAdd();
+
+    try {
+      const draft = await AIListing.generate(res.payload);
+      addState.draft = normalizeDraft(draft);
+      addState.step = "review";
+    } catch (err) {
+      console.warn("[AIListing] generate failed:", err);
+      addState.genError = (err && err.message) ? err.message : "The AI didn't return a usable listing.";
+      addState.step = "error";
+    }
+    renderAdd();
+  }
+
+  // Coerce whatever generate() returned into a clean listing object.
+  function normalizeDraft(raw) {
+    const base = AppStore.makeListing();
+    if (raw && typeof raw === "object") {
+      if (typeof raw.title === "string") base.title = raw.title;
+      if (typeof raw.description === "string") base.description = raw.description;
+      const sp = Number(raw.suggestedPrice);
+      base.suggestedPrice = isNaN(sp) ? "" : sp;
+      if (raw.platforms && typeof raw.platforms === "object") {
+        PLATFORMS.forEach(function (p) {
+          if (typeof raw.platforms[p] === "string") base.platforms[p] = raw.platforms[p];
+        });
+      }
+    }
+    return base;
+  }
+
+  function onSaveListing() {
+    const d = addState.draft || AppStore.makeListing();
+    const price = parseFloat(d.suggestedPrice);
+    const listing = AppStore.makeListing({
+      title: (d.title || "").trim(),
+      description: (d.description || "").trim(),
+      suggestedPrice: isNaN(price) ? 0 : price,
+      platforms: {
+        poshmark: d.platforms.poshmark || "",
+        ebay: d.platforms.ebay || "",
+        mercari: d.platforms.mercari || "",
+        depop: d.platforms.depop || ""
+      }
+    });
+    withoutAddRerender(function () {
+      const latest = readIntake();
+      if (latest.ok) ensureDraftItem(latest.payload); // make sure item reflects latest fields
+      AppStore.updateItem(addState.itemId, { listing: listing, status: STATUS.LISTED });
+    });
+    addState.step = "done";
+    renderAdd();
+  }
+
+  function onDiscardFlow() {
+    // Remove the draft item we created so nothing orphaned is left behind.
+    withoutAddRerender(function () {
+      if (addState.itemId) AppStore.removeItem(addState.itemId);
+    });
+    resetAddFlow();
+    renderAdd();
+  }
+
+  function resetAddFlow() {
+    addState.step = "intake";
+    addState.form = freshForm();
+    addState.error = "";
+    addState.itemId = null;
+    addState.draft = null;
+    addState.genError = "";
+  }
+
+  /* ---------------------- copy-to-clipboard w/ fallback (SPE-8) ---------------------- */
+  let copyToastTimer = null;
+  function showCopiedToast(msg) {
+    let el = document.getElementById("copiedToast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "copiedToast";
+      el.className = "copied-toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = msg || "Copied!";
+    // force reflow so re-triggering the transition works
+    void el.offsetWidth;
+    el.classList.add("show");
+    if (copyToastTimer) clearTimeout(copyToastTimer);
+    copyToastTimer = setTimeout(function () { el.classList.remove("show"); }, 1400);
+  }
+
+  // Non-blocking storage warning banner (SPE-15). Shows briefly; never blocks.
+  let storageWarnTimer = null;
+  function showStorageWarning(msg) {
+    let el = document.getElementById("storageWarn");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "storageWarn";
+      el.className = "storage-warn";
+      el.setAttribute("role", "status");
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    void el.offsetWidth;
+    el.classList.add("show");
+    if (storageWarnTimer) clearTimeout(storageWarnTimer);
+    storageWarnTimer = setTimeout(function () { el.classList.remove("show"); }, 6000);
+  }
+
+  function copyText(text, btn) {
+    function done() {
+      showCopiedToast("Copied!");
+      if (btn) {
+        const orig = btn.textContent;
+        btn.textContent = "Copied!";
+        setTimeout(function () { btn.textContent = orig; }, 1200);
+      }
+    }
+    function fallback() {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        done();
+      } catch (e) {
+        console.warn("[copy] fallback failed:", e);
+      }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  /* ===========================================================================
+     [INVENTORY]  — SPE-10 (list + detail) / SPE-11 (Not Listing / delete)
+     ---------------------------------------------------------------------------
+     The Inventory tab is a two-mode view (list <-> item detail) rendered by
+     renderInventory() into #inventoryList. Like the Add flow, it keeps transient
+     UI scratch in `invState` (NOT persisted — it's view state, not data).
+
+     Because the store notifies on every mutation and renderActive() re-renders
+     the visible tab, renderInventory() must be safe to call at any time: it
+     rebuilds from invState + AppStore each call. Detail-view edits save via
+     AppStore.updateItem; the resulting notify() re-renders detail in place.
+     If the currently-open detail item is deleted, we fall back to the list.
+
+     invState = {
+       mode:   'list' | 'detail',
+       filter: one of INV_FILTERS keys (default 'active'),
+       itemId: string|null,            // item shown in detail mode
+       confirmDelete: bool             // delete-confirm step visible in detail
+     }
+     =========================================================================== */
+  const invState = {
+    mode: "list", filter: "active", itemId: null, confirmDelete: false,
+    // SPE-12: in-detail "Mark as Sold" form + success moment.
+    saleForm: null,        // { price, platform, fee } working values, or null when closed
+    saleDone: null,        // { profit } to show the success moment after confirming
+    confirmUndo: false,    // undo-sale confirm step
+    // SPE-13: delete-bundle confirm (shown on a bundled item's detail)
+    confirmBundleDelete: false,
+    // SPE-13: multi-select bundle mode over the list
+    selectMode: false,
+    selected: {},          // { itemId: true }
+    bundleStep: "select",  // 'select' | 'form'
+    bundleForm: null,      // { totalPrice, platform, fee, date }
+    bundleDone: null       // { bundleId, profit } success moment after creating a bundle
+  };
+
+  // Filter chips. `test(item)` decides membership. "Active" excludes both
+  // not-listing and sold (ticket SPE-10); the store's {active:true} only drops
+  // not-listing, so we filter here to also drop sold.
+  const INV_FILTERS = [
+    { key: "active",      label: "Active",      test: function (i) { return i.status !== STATUS.NOT_LISTING && i.status !== STATUS.SOLD; } },
+    { key: "all",         label: "All",         test: function () { return true; } },
+    { key: "listed",      label: "Listed",      test: function (i) { return i.status === STATUS.LISTED; } },
+    { key: "draft",       label: "Draft",       test: function (i) { return i.status === STATUS.DRAFT; } },
+    { key: "sold",        label: "Sold",        test: function (i) { return i.status === STATUS.SOLD; } },
+    { key: "not-listing", label: "Not Listing", test: function (i) { return i.status === STATUS.NOT_LISTING; } }
+  ];
+
+  // Display title for an item: listing title if present, else brand + category.
+  function itemDisplayTitle(i) {
+    if (i.listing && i.listing.title && i.listing.title.trim()) return i.listing.title.trim();
+    const t = [i.brand, i.category].filter(Boolean).join(" ");
+    return t || "Untitled item";
+  }
+
+  // Key-details line: brand · size · condition · cost paid (only present bits).
+  function itemDetailLine(i) {
+    return [
+      i.brand || "",
+      i.size ? "Size " + i.size : "",
+      i.condition ? (CONDITION_LABELS[i.condition] || i.condition) : "",
+      "Cost " + money(i.costPaid)
+    ].filter(Boolean).join(" · ");
+  }
+
+  // Neutral placeholder icon markup for items without a photo.
+  function thumbHTML(i, cls) {
+    if (i.photo) {
+      return '<img class="' + cls + '" src="' + i.photo + '" alt="" />';
+    }
+    return '<div class="' + cls + ' placeholder-thumb">&#128248;</div>'; // 📸
+  }
+
+  // ---- Inventory dispatcher (SPE-10/11/13) ----
+  function renderInventory() {
+    const el = document.getElementById("inventoryList");
+    if (!el) return;
+
+    // Bundle success moment (SPE-13) takes over the whole list view briefly.
+    if (invState.bundleDone) {
+      el.innerHTML = bundleDoneHTML();
+      wireBundleDone();
+      return;
+    }
+
+    // Bundle multi-select / form flow (SPE-13) replaces the normal list.
+    if (invState.selectMode) {
+      if (invState.bundleStep === "form") {
+        el.innerHTML = bundleFormHTML();
+        wireBundleForm();
+      } else {
+        el.innerHTML = bundleSelectHTML();
+        wireBundleSelect();
+      }
+      return;
+    }
+
+    if (invState.mode === "detail") {
+      const item = invState.itemId ? AppStore.getItem(invState.itemId) : null;
+      if (!item) {
+        // Item vanished (e.g. deleted) — fall back to the list.
+        invState.mode = "list";
+        invState.itemId = null;
+        resetDetailFlags();
+      } else {
+        el.innerHTML = inventoryDetailHTML(item);
+        wireInventoryDetail(item);
+        return;
+      }
+    }
+    el.innerHTML = inventoryListHTML();
+    wireInventoryList();
+  }
+
+  // Items eligible for a bundle sale: not already sold, not "not-listing".
+  function sellableItems() {
+    return AppStore.listItems().filter(function (i) {
+      return i.status !== STATUS.SOLD && i.status !== STATUS.NOT_LISTING;
+    });
+  }
+
+  /* ---------------------- MODE: list (SPE-10) ---------------------- */
+  function inventoryListHTML() {
+    const all = AppStore.listItems(); // newest first
+    const active = INV_FILTERS.find(function (f) { return f.key === invState.filter; }) || INV_FILTERS[0];
+    const shown = all.filter(active.test);
+
+    const chips = INV_FILTERS.map(function (f) {
+      const count = all.filter(f.test).length;
+      return '<button class="chip' + (f.key === invState.filter ? " active" : "") + '" ' +
+        'data-filter="' + f.key + '">' + escapeHtml(f.label) +
+        '<span class="count">' + count + '</span></button>';
+    }).join("");
+
+    let body;
+    if (all.length === 0) {
+      body =
+        '<div class="card"><div class="placeholder">' +
+        '<span class="emoji">&#128230;</span>' +
+        'No items yet. Add your first from the <b>Add Item</b> tab.' +
+        '</div></div>';
+    } else if (shown.length === 0) {
+      body =
+        '<div class="card"><div class="placeholder">' +
+        '<span class="emoji">&#128269;</span>' +
+        'Nothing under <b>' + escapeHtml(active.label) + '</b>.' +
+        '<div class="muted" style="margin-top:8px;">Try another filter, or add items from the <b>Add Item</b> tab.</div>' +
+        '</div></div>';
+    } else {
+      body = shown.map(inventoryRowHTML).join("");
+    }
+
+    // "Bundle Sale" entry point (SPE-13): only when >=2 sellable items exist.
+    const bundleBar = sellableItems().length >= 2
+      ? '<div class="bundle-bar">' +
+          '<button class="btn secondary small" type="button" id="startBundleBtn">' +
+          '&#128230; Bundle Sale</button>' +
+        '</div>'
+      : "";
+
+    return '<div class="filter-chips">' + chips + '</div>' + bundleBar + body;
+  }
+
+  function inventoryRowHTML(i) {
+    return '' +
+      '<button class="inv-row" data-item="' + i.id + '">' +
+        thumbHTML(i, "inv-thumb") +
+        '<div class="inv-meta">' +
+          '<div class="inv-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
+          '<div class="inv-sub">' + escapeHtml(itemDetailLine(i)) + '</div>' +
+          '<div class="inv-badges"><span class="badge ' + i.status + '">' + statusLabel(i.status) + '</span></div>' +
+        '</div>' +
+        '<span class="inv-chevron">&rsaquo;</span>' +
+      '</button>';
+  }
+
+  function wireInventoryList() {
+    const el = document.getElementById("inventoryList");
+    if (!el) return;
+    const startBundle = document.getElementById("startBundleBtn");
+    if (startBundle) startBundle.addEventListener("click", function () {
+      invState.selectMode = true;
+      invState.bundleStep = "select";
+      invState.selected = {};
+      invState.bundleForm = null;
+      renderInventory();
+    });
+    el.querySelectorAll(".chip").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        invState.filter = btn.getAttribute("data-filter");
+        renderInventory();
+      });
+    });
+    el.querySelectorAll(".inv-row").forEach(function (row) {
+      row.addEventListener("click", function () {
+        // In multi-select mode, rows toggle selection instead of opening detail.
+        if (invState.selectMode) {
+          const iid = row.getAttribute("data-item");
+          if (invState.selected[iid]) delete invState.selected[iid];
+          else invState.selected[iid] = true;
+          renderInventory();
+          return;
+        }
+        invState.itemId = row.getAttribute("data-item");
+        invState.mode = "detail";
+        resetDetailFlags();
+        const main = document.querySelector(".app-main");
+        if (main) main.scrollTop = 0;
+        renderInventory();
+      });
+    });
+  }
+
+  // Reset all per-detail transient flags (SPE-12/13) when entering/leaving detail.
+  function resetDetailFlags() {
+    invState.confirmDelete = false;
+    invState.saleForm = null;
+    invState.saleDone = null;
+    invState.confirmUndo = false;
+    invState.confirmBundleDelete = false;
+  }
+
+  /* =========================================================================
+     SPE-13: Bundle sale flow (multi-select -> form -> confirm -> success)
+     ========================================================================= */
+
+  // Fully exit the bundle flow back to the plain list.
+  function exitBundleFlow() {
+    invState.selectMode = false;
+    invState.bundleStep = "select";
+    invState.selected = {};
+    invState.bundleForm = null;
+  }
+
+  function selectedIds() {
+    return Object.keys(invState.selected).filter(function (k) { return invState.selected[k]; });
+  }
+
+  /* ---------------------- STEP: multi-select ---------------------- */
+  function bundleSelectHTML() {
+    const items = sellableItems(); // non-sold, non-not-listing
+    const n = selectedIds().length;
+
+    const rows = items.map(function (i) {
+      const on = !!invState.selected[i.id];
+      return '' +
+        '<button class="inv-row selectable' + (on ? " selected" : "") + '" data-item="' + i.id + '">' +
+          '<span class="sel-check">' + (on ? "&#10003;" : "") + '</span>' +
+          thumbHTML(i, "inv-thumb") +
+          '<div class="inv-meta">' +
+            '<div class="inv-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
+            '<div class="inv-sub">' + escapeHtml(itemDetailLine(i)) + '</div>' +
+            '<div class="inv-badges"><span class="badge ' + i.status + '">' + statusLabel(i.status) + '</span></div>' +
+          '</div>' +
+        '</button>';
+    }).join("");
+
+    return '' +
+      '<div class="card">' +
+        '<h2>Bundle Sale</h2>' +
+        '<p class="muted">Select the items sold together, then enter one total price and one fee.</p>' +
+      '</div>' +
+      '<div class="select-hint">' + n + ' selected' +
+        (n < 2 ? ' &middot; pick at least 2' : '') + '</div>' +
+      rows +
+      '<div class="bundle-actionbar">' +
+        '<button class="btn secondary" type="button" data-act="bundle-cancel" style="flex:1;">Cancel</button>' +
+        '<button class="btn" type="button" data-act="bundle-next" style="flex:1;"' +
+          (n < 2 ? ' disabled' : '') + '>Next &rarr;</button>' +
+      '</div>';
+  }
+
+  function wireBundleSelect() {
+    const el = document.getElementById("inventoryList");
+    if (!el) return;
+    el.querySelectorAll(".inv-row").forEach(function (row) {
+      row.addEventListener("click", function () {
+        const iid = row.getAttribute("data-item");
+        if (invState.selected[iid]) delete invState.selected[iid];
+        else invState.selected[iid] = true;
+        renderInventory();
+      });
+    });
+    el.querySelectorAll("[data-act]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        const act = btn.getAttribute("data-act");
+        if (act === "bundle-cancel") { exitBundleFlow(); renderInventory(); }
+        else if (act === "bundle-next") {
+          if (selectedIds().length < 2) return;
+          invState.bundleForm = { totalPrice: "", platform: PLATFORMS[0], fee: "0", date: todayInputValue() };
+          invState.bundleStep = "form";
+          const main = document.querySelector(".app-main");
+          if (main) main.scrollTop = 0;
+          renderInventory();
+        }
+      });
+    });
+  }
+
+  /* ---------------------- STEP: bundle form ---------------------- */
+  function bundleFormHTML() {
+    const bf = invState.bundleForm || { totalPrice: "", platform: PLATFORMS[0], fee: "0", date: todayInputValue() };
+    const ids = selectedIds();
+    const items = ids.map(AppStore.getItem).filter(Boolean);
+    const totalCost = items.reduce(function (s, i) { return s + (Number(i.costPaid) || 0); }, 0);
+
+    // Summary strip of chosen items.
+    const chosen = items.map(function (i) {
+      return '<div class="bundle-child">' +
+        thumbHTML(i, "inv-thumb") +
+        '<div class="bc-meta"><div class="bc-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
+        '<div class="bc-sub">Cost ' + money(i.costPaid) + '</div></div></div>';
+    }).join("");
+
+    const platOpts = PLATFORMS.map(function (p) {
+      return '<option value="' + p + '"' + (bf.platform === p ? " selected" : "") + '>' +
+        escapeHtml(PLATFORM_LABELS[p]) + '</option>';
+    }).join("") +
+      '<option value="other"' + (bf.platform === "other" ? " selected" : "") + '>Other</option>';
+
+    return '' +
+      '<div class="card">' +
+        '<h2>Bundle Sale &middot; ' + items.length + ' items</h2>' +
+        '<p class="muted">Combined cost of these items: ' + money(totalCost) + '</p>' +
+        '<div class="kv-list" style="margin-top:8px;">' +
+          '<div class="bundle-children" style="margin:0;">' + chosen + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="card">' +
+        '<div class="section-label">Sale details</div>' +
+        '<div class="field"><label>Total price (USD)</label>' +
+          '<div class="price-input-wrap"><span class="dollar">$</span>' +
+          '<input id="bfTotal" type="number" inputmode="decimal" step="0.01" min="0" ' +
+            'value="' + escapeHtml(bf.totalPrice) + '" placeholder="0.00" /></div></div>' +
+        '<div class="row">' +
+          '<div class="field"><label>Platform</label>' +
+            '<select id="bfPlatform">' + platOpts + '</select></div>' +
+          '<div class="field"><label>Fee (USD)</label>' +
+            '<div class="price-input-wrap"><span class="dollar">$</span>' +
+            '<input id="bfFee" type="number" inputmode="decimal" step="0.01" min="0" ' +
+              'value="' + escapeHtml(bf.fee) + '" placeholder="0.00" /></div></div>' +
+        '</div>' +
+        '<div class="field"><label>Sale date</label>' +
+          '<input id="bfDate" type="date" value="' + escapeHtml(bf.date) + '" /></div>' +
+      '</div>' +
+      '<button class="btn" type="button" data-act="bundle-confirm">Confirm bundle sale</button>' +
+      '<button class="btn secondary" type="button" data-act="bundle-back" style="margin-top:10px;">&lsaquo; Back to selection</button>';
+  }
+
+  function wireBundleForm() {
+    const bind = function (elId, key) {
+      const inp = document.getElementById(elId);
+      if (inp) inp.addEventListener("input", function () { invState.bundleForm[key] = inp.value; });
+    };
+    bind("bfTotal", "totalPrice");
+    bind("bfFee", "fee");
+    bind("bfDate", "date");
+    const plat = document.getElementById("bfPlatform");
+    if (plat) plat.addEventListener("change", function () { invState.bundleForm.platform = plat.value; });
+
+    const el = document.getElementById("inventoryList");
+    if (!el) return;
+    el.querySelectorAll("[data-act]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        const act = btn.getAttribute("data-act");
+        if (act === "bundle-back") {
+          invState.bundleStep = "select";
+          renderInventory();
+        } else if (act === "bundle-confirm") {
+          onConfirmBundleSale();
+        }
+      });
+    });
+  }
+
+  function onConfirmBundleSale() {
+    const bf = invState.bundleForm;
+    const ids = selectedIds();
+    if (!bf || ids.length < 2) return;
+    const total = parseFloat(bf.totalPrice);
+    const fee = parseFloat(bf.fee);
+    const platform = bf.platform || "other";
+    const dateMs = dateInputToMs(bf.date);
+
+    // Perform all store mutations together, suppressing intermediate re-renders
+    // (they'd redraw the form mid-loop), then set success state + render once.
+    let bundle;
+    withoutInvRerender(function () {
+      // Create the Bundle first (revenue + fee live here, per I4).
+      bundle = AppStore.addBundle({
+        date: dateMs,
+        platform: platform,
+        totalPrice: isNaN(total) ? 0 : total,
+        fee: isNaN(fee) ? 0 : fee,
+        itemIds: ids.slice()
+      });
+      // Mark every selected item sold, with per-item price=0 and fee=0 (I4).
+      ids.forEach(function (iid) {
+        AppStore.updateItem(iid, {
+          status: STATUS.SOLD,
+          sale: { price: 0, platform: platform, fee: 0, date: dateMs, bundleId: bundle.id }
+        });
+      });
+    });
+
+    const profit = Sales.bundleProfit(bundle);
+    // Leave select mode; show success moment.
+    invState.selectMode = false;
+    invState.bundleStep = "select";
+    invState.selected = {};
+    invState.bundleForm = null;
+    invState.bundleDone = { bundleId: bundle.id, profit: profit };
+    const main = document.querySelector(".app-main");
+    if (main) main.scrollTop = 0;
+    renderInventory();
+  }
+
+  /* ---------------------- STEP: bundle success ---------------------- */
+  function bundleDoneHTML() {
+    const bd = invState.bundleDone;
+    const bundle = bd ? AppStore.getBundle(bd.bundleId) : null;
+    const pr = bd ? bd.profit : 0;
+    const n = bundle ? (bundle.itemIds || []).length : 0;
+    return '' +
+      '<div class="card">' +
+        '<div class="sale-form"><div class="profit-pop">' +
+          '<span class="emoji">&#127881;</span>' +
+          '<div class="lbl">Bundle sold &middot; ' + n + ' items</div>' +
+          '<div class="amt ' + (pr >= 0 ? "pos" : "neg") + '">' + moneySigned(pr) + '</div>' +
+          (bundle
+            ? '<div class="sub">' + money(bundle.totalPrice) + ' total &minus; ' +
+              money(Sales.bundleCost(bundle)) + ' cost &minus; ' + money(bundle.fee) + ' fee</div>'
+            : '') +
+        '</div></div>' +
+        '<button class="btn" type="button" data-act="bundle-done-ok">Done</button>' +
+      '</div>';
+  }
+
+  function wireBundleDone() {
+    const el = document.getElementById("inventoryList");
+    if (!el) return;
+    el.querySelectorAll("[data-act]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        if (btn.getAttribute("data-act") === "bundle-done-ok") {
+          invState.bundleDone = null;
+          invState.filter = "active";
+          renderInventory();
+        }
+      });
+    });
+  }
+
+  /* ---------------------- MODE: item detail (SPE-10/11) ---------------------- */
+  function inventoryDetailHTML(i) {
+    const catLine = [i.brand, i.category].filter(Boolean).join(" ") || "Untitled item";
+
+    // Core fields (always shown).
+    const fields = [
+      ["Status", statusLabel(i.status)],
+      ["Brand", i.brand || "—"],
+      ["Category", i.category || "—"],
+      ["Size", i.size || "—"],
+      ["Condition", i.condition ? (CONDITION_LABELS[i.condition] || i.condition) : "—"],
+      ["Cost paid", money(i.costPaid)]
+    ];
+    // Sold info (SPE-12 single sale / SPE-13 bundled sale). Bundled items show the
+    // bundle's figures, not per-item ones (per I4). `profitCls` colours the row.
+    const soldRows = []; // each: [k, v, valueClass?]
+    let bundleForItem = null;
+    if (i.status === STATUS.SOLD && i.sale) {
+      const platLabel = PLATFORM_LABELS[i.sale.platform] || i.sale.platform || "—";
+      if (i.sale.bundleId) {
+        bundleForItem = AppStore.getBundle(i.sale.bundleId);
+        if (bundleForItem) {
+          const bp = Sales.bundleProfit(bundleForItem);
+          soldRows.push(["Sold on", PLATFORM_LABELS[bundleForItem.platform] || bundleForItem.platform || "—"]);
+          soldRows.push(["Sold date", formatSaleDate(bundleForItem.date)]);
+          soldRows.push(["Bundle total", money(bundleForItem.totalPrice)]);
+          soldRows.push(["Bundle fee", money(bundleForItem.fee)]);
+          soldRows.push(["Bundle profit", moneySigned(bp), bp >= 0 ? "pos" : "neg"]);
+        }
+      } else {
+        const p = Sales.singleProfit(i);
+        soldRows.push(["Sold for", money(i.sale.price)]);
+        soldRows.push(["Sold on", platLabel]);
+        soldRows.push(["Sold date", formatSaleDate(i.sale.date)]);
+        soldRows.push(["Platform fee", money(i.sale.fee)]);
+        soldRows.push(["Profit", moneySigned(p), p >= 0 ? "pos" : "neg"]);
+      }
+    }
+    fields.push.apply(fields, soldRows.map(function (r) { return [r[0], r[1]]; }));
+
+    const kv = fields.map(function (f, idx) {
+      // fields beyond the base 6 are sold rows; carry their value class if any.
+      const soldIdx = idx - 6;
+      const cls = (soldIdx >= 0 && soldRows[soldIdx] && soldRows[soldIdx][2]) ? " " + soldRows[soldIdx][2] : "";
+      return '<div class="kv-row"><span class="k">' + escapeHtml(f[0]) + '</span>' +
+        '<span class="v' + cls + '">' + escapeHtml(f[1]) + '</span></div>';
+    }).join("");
+
+    // Listing block (editable) — only when a listing exists. Reuses the Phase 2
+    // per-platform pattern (pdot / phead / pactions / Copy / Go to Platform).
+    let listingBlock = "";
+    if (i.listing) {
+      const d = i.listing;
+      const platformBlocks = PLATFORMS.map(function (p) {
+        return '' +
+          '<div class="platform-block" data-platform="' + p + '">' +
+            '<div class="phead">' +
+              '<span class="pname"><span class="pdot ' + p + '"></span>' + escapeHtml(PLATFORM_LABELS[p]) + '</span>' +
+              '<div class="pactions">' +
+                '<button class="btn secondary" type="button" data-copy="' + p + '">Copy</button>' +
+                '<button class="btn ghost" type="button" data-go="' + p + '">Go to ' + escapeHtml(PLATFORM_LABELS[p]) + '</button>' +
+              '</div>' +
+            '</div>' +
+            '<textarea data-dfield="platform" data-platform-field="' + p + '">' + escapeHtml(d.platforms[p] || "") + '</textarea>' +
+          '</div>';
+      }).join("");
+
+      listingBlock = '' +
+        '<div class="card">' +
+          '<div class="section-label">Listing &middot; everything editable</div>' +
+          '<div class="field"><label>Title</label>' +
+            '<input data-dfield="title" value="' + escapeHtml(d.title || "") + '" /></div>' +
+          '<div class="field"><label>Description</label>' +
+            '<textarea data-dfield="description" style="min-height:110px;">' + escapeHtml(d.description || "") + '</textarea></div>' +
+          '<div class="field"><label>Suggested price (USD)</label>' +
+            '<div class="price-input-wrap"><span class="dollar">$</span>' +
+            '<input data-dfield="suggestedPrice" type="number" inputmode="decimal" step="0.01" min="0" ' +
+              'value="' + escapeHtml(numOrEmpty(d.suggestedPrice)) + '" /></div></div>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="section-label">Per-platform text</div>' +
+          platformBlocks +
+        '</div>';
+    } else {
+      listingBlock =
+        '<div class="card"><div class="placeholder" style="padding:24px 12px;">' +
+        '<span class="emoji">&#128221;</span>' +
+        'No listing yet for this item.' +
+        '<div class="muted" style="margin-top:6px;">This is a draft. Generate a listing from the Add Item tab.</div>' +
+        '</div></div>';
+    }
+
+    // Status actions (SPE-11) + Mark as Sold / Undo sale (SPE-12/13).
+    let statusActions = "";
+    const isNotListing = i.status === STATUS.NOT_LISTING;
+    if (isNotListing) {
+      // Reverse action: relist. Back to draft if no listing, else listed.
+      statusActions =
+        '<button class="btn secondary" type="button" data-act="relist">Back to inventory</button>';
+    } else if (i.status === STATUS.SOLD) {
+      // ---- Sold item: success moment (just marked) OR Undo sale action ----
+      if (invState.saleDone && invState.saleDone.itemId === i.id) {
+        const pr = invState.saleDone.profit;
+        statusActions =
+          '<div class="sale-form"><div class="profit-pop">' +
+            '<span class="emoji">&#127881;</span>' +
+            '<div class="lbl">Sold! Your profit</div>' +
+            '<div class="amt ' + (pr >= 0 ? "pos" : "neg") + '">' + moneySigned(pr) + '</div>' +
+            '<div class="sub">' + money(i.sale.price) + ' sale &minus; ' + money(i.costPaid) +
+              ' cost &minus; ' + money(i.sale.fee) + ' fee</div>' +
+          '</div></div>' +
+          '<button class="btn" type="button" data-act="sale-done-ok" style="margin-top:10px;">Done</button>';
+      } else if (i.sale && i.sale.bundleId) {
+        // Part of a bundle — undo is blocked; must delete the bundle instead.
+        if (invState.confirmBundleDelete && bundleForItem) {
+          const others = (bundleForItem.itemIds || []).length;
+          statusActions =
+            '<div class="confirm-box">' +
+              '<p>Delete this bundle sale? All ' + others + ' item' + (others === 1 ? "" : "s") +
+                ' in it will be un-sold and returned to inventory.</p>' +
+              '<div class="row">' +
+                '<button class="btn danger" type="button" data-act="bundle-delete-confirm" style="flex:1;">Delete bundle</button>' +
+                '<button class="btn secondary" type="button" data-act="bundle-delete-cancel" style="flex:1;">Cancel</button>' +
+              '</div>' +
+            '</div>';
+        } else {
+          statusActions =
+            '<p class="muted" style="margin:0 0 10px;">This item was sold as part of a bundle. ' +
+              'To un-sell it, delete the whole bundle.</p>' +
+            '<button class="btn danger-ghost" type="button" data-act="bundle-delete">Delete bundle sale</button>';
+        }
+      } else {
+        // Single sale — offer Undo (with confirm).
+        if (invState.confirmUndo) {
+          statusActions =
+            '<div class="confirm-box">' +
+              '<p>Undo this sale? The item goes back to your active inventory.</p>' +
+              '<div class="row">' +
+                '<button class="btn danger" type="button" data-act="undo-confirm" style="flex:1;">Undo sale</button>' +
+                '<button class="btn secondary" type="button" data-act="undo-cancel" style="flex:1;">Cancel</button>' +
+              '</div>' +
+            '</div>';
+        } else {
+          statusActions =
+            '<button class="btn secondary" type="button" data-act="undo-sale">Undo sale</button>';
+        }
+      }
+    } else if (invState.saleForm && invState.saleForm.itemId === i.id) {
+      // ---- Mark as Sold form is open (SPE-12) ----
+      const sf = invState.saleForm;
+      const platOpts = PLATFORMS.map(function (p) {
+        return '<option value="' + p + '"' + (sf.platform === p ? " selected" : "") + '>' +
+          escapeHtml(PLATFORM_LABELS[p]) + '</option>';
+      }).join("") +
+        '<option value="other"' + (sf.platform === "other" ? " selected" : "") + '>Other</option>';
+      statusActions =
+        '<div class="sale-form">' +
+          '<div class="section-label">Mark as sold</div>' +
+          '<div class="field"><label>Sale price (USD)</label>' +
+            '<div class="price-input-wrap"><span class="dollar">$</span>' +
+            '<input id="salerPrice" type="number" inputmode="decimal" step="0.01" min="0" ' +
+              'value="' + escapeHtml(sf.price) + '" placeholder="0.00" /></div></div>' +
+          '<div class="form-row">' +
+            '<div class="field"><label>Platform sold on</label>' +
+              '<select id="salerPlatform">' + platOpts + '</select></div>' +
+            '<div class="field"><label>Platform fee (USD)</label>' +
+              '<div class="price-input-wrap"><span class="dollar">$</span>' +
+              '<input id="salerFee" type="number" inputmode="decimal" step="0.01" min="0" ' +
+                'value="' + escapeHtml(sf.fee) + '" placeholder="0.00" /></div></div>' +
+          '</div>' +
+          '<div class="helper">Enter the platform’s cut (shipping/selling fees) so profit is accurate.</div>' +
+          '<button class="btn" type="button" data-act="sale-confirm">Confirm sale</button>' +
+          '<button class="btn secondary" type="button" data-act="sale-cancel" style="margin-top:10px;">Cancel</button>' +
+        '</div>';
+    } else {
+      // ---- Default sellable-item actions ----
+      statusActions =
+        '<button class="btn" type="button" id="markSoldBtn" data-act="mark-sold">Mark as Sold</button>' +
+        '<button class="btn secondary" type="button" data-act="not-listing">Mark &ldquo;Not Listing&rdquo;</button>';
+    }
+
+    // Delete (with confirm step). Hidden while a sale form / success moment /
+    // undo or bundle-delete confirm is showing, to keep the action area focused.
+    const saleFlowActive =
+      (invState.saleForm && invState.saleForm.itemId === i.id) ||
+      (invState.saleDone && invState.saleDone.itemId === i.id) ||
+      invState.confirmUndo || invState.confirmBundleDelete;
+    const deleteBlock = saleFlowActive
+      ? ""
+      : (invState.confirmDelete
+        ? '<div class="confirm-box">' +
+            '<p>Delete this item permanently? This can’t be undone.</p>' +
+            '<div class="row">' +
+              '<button class="btn danger" type="button" data-act="delete-confirm" style="flex:1;">Delete</button>' +
+              '<button class="btn secondary" type="button" data-act="delete-cancel" style="flex:1;">Cancel</button>' +
+            '</div>' +
+          '</div>'
+        : '<button class="btn danger-ghost" type="button" data-act="delete">Delete item</button>');
+
+    // "Sold in bundle" note (SPE-13) shown on bundled items' detail.
+    const soldNote = (i.status === STATUS.SOLD && i.sale && i.sale.bundleId && bundleForItem)
+      ? '<div class="sold-note"><span>&#128230;</span><span>Sold in bundle &middot; ' +
+          (bundleForItem.itemIds || []).length + ' items on ' +
+          escapeHtml(PLATFORM_LABELS[bundleForItem.platform] || bundleForItem.platform || "—") +
+          '</span></div>'
+      : "";
+
+    return '' +
+      '<button class="detail-back" type="button" id="detailBackBtn">&lsaquo; Inventory</button>' +
+      '<div class="card">' +
+        thumbHTML(i, "detail-photo") +
+        '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:12px;">' +
+          '<h2 style="margin:0;font-size:16px;">' + escapeHtml(catLine) + '</h2>' +
+          '<span class="badge ' + i.status + '">' + statusLabel(i.status) + '</span>' +
+        '</div>' +
+        soldNote +
+        '<div class="kv-list">' + kv + '</div>' +
+      '</div>' +
+      listingBlock +
+      '<div class="card">' +
+        '<div class="section-label">Actions</div>' +
+        '<div class="detail-actions">' +
+          statusActions +
+          deleteBlock +
+        '</div>' +
+      '</div>';
+  }
+
+  function wireInventoryDetail(item) {
+    const el = document.getElementById("inventoryList");
+    if (!el) return;
+    const id = item.id;
+
+    const back = document.getElementById("detailBackBtn");
+    if (back) back.addEventListener("click", function () {
+      invState.mode = "list";
+      invState.itemId = null;
+      resetDetailFlags();
+      const main = document.querySelector(".app-main");
+      if (main) main.scrollTop = 0;
+      renderInventory();
+    });
+
+    // Live-save listing field edits back to the store (SPE-8 pattern reused).
+    // We mutate a fresh copy of the listing and updateItem so getters stay clean.
+    if (item.listing) {
+      el.querySelectorAll("[data-dfield]").forEach(function (elm) {
+        elm.addEventListener("input", function () {
+          const cur = AppStore.getItem(id);
+          if (!cur || !cur.listing) return;
+          const field = elm.getAttribute("data-dfield");
+          const listing = Object.assign({}, cur.listing, {
+            platforms: Object.assign({}, cur.listing.platforms)
+          });
+          if (field === "platform") {
+            listing.platforms[elm.getAttribute("data-platform-field")] = elm.value;
+          } else if (field === "suggestedPrice") {
+            const v = parseFloat(elm.value);
+            listing.suggestedPrice = isNaN(v) ? 0 : v;
+          } else {
+            listing[field] = elm.value;
+          }
+          // Suppress the store-driven re-render so we don't clobber the field
+          // the user is actively typing in (mirrors suppressAddRerender intent).
+          withoutInvRerender(function () { AppStore.updateItem(id, { listing: listing }); });
+        });
+      });
+      // Copy buttons (reuse copyText helper).
+      el.querySelectorAll("[data-copy]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const cur = AppStore.getItem(id);
+          const p = btn.getAttribute("data-copy");
+          copyText((cur && cur.listing && cur.listing.platforms[p]) || "", btn);
+        });
+      });
+      // Go-to-platform buttons (reuse PLATFORM_URLS).
+      el.querySelectorAll("[data-go]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const url = PLATFORM_URLS[btn.getAttribute("data-go")];
+          if (url) window.open(url, "_blank", "noopener");
+        });
+      });
+    }
+
+    // Live-bind the Mark-as-Sold form fields into invState.saleForm so a
+    // store-driven re-render (should one happen) can't clobber typed values.
+    // These are plain UI-scratch fields (not store data), so no store write here.
+    if (invState.saleForm && invState.saleForm.itemId === id) {
+      const bind = function (elId, key) {
+        const inp = document.getElementById(elId);
+        if (inp) inp.addEventListener("input", function () { invState.saleForm[key] = inp.value; });
+      };
+      bind("salerPrice", "price");
+      bind("salerFee", "fee");
+      const plat = document.getElementById("salerPlatform");
+      if (plat) plat.addEventListener("change", function () { invState.saleForm.platform = plat.value; });
+    }
+
+    // Status + sale + delete actions.
+    el.querySelectorAll("[data-act]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        const act = btn.getAttribute("data-act");
+        if (act === "not-listing") {
+          AppStore.updateItem(id, { status: STATUS.NOT_LISTING });
+          // store notify() re-renders detail in place with the new status/actions.
+        } else if (act === "relist") {
+          // Reverse: go back to 'listed' if a listing exists, else 'draft'.
+          const cur = AppStore.getItem(id);
+          const back = (cur && cur.listing) ? STATUS.LISTED : STATUS.DRAFT;
+          AppStore.updateItem(id, { status: back });
+        // ---- Mark as Sold (SPE-12) ----
+        } else if (act === "mark-sold") {
+          const cur = AppStore.getItem(id);
+          const suggested = (cur && cur.listing && cur.listing.suggestedPrice)
+            ? numOrEmpty(cur.listing.suggestedPrice) : "";
+          invState.saleForm = { itemId: id, price: suggested, platform: PLATFORMS[0], fee: "0" };
+          invState.saleDone = null;
+          renderInventory();
+        } else if (act === "sale-cancel") {
+          invState.saleForm = null;
+          renderInventory();
+        } else if (act === "sale-done-ok") {
+          // Dismiss the single-sale success moment; item stays sold.
+          invState.saleDone = null;
+          renderInventory();
+        } else if (act === "sale-confirm") {
+          onConfirmSingleSale(id);
+        } else if (act === "undo-sale") {
+          invState.confirmUndo = true;
+          renderInventory();
+        } else if (act === "undo-cancel") {
+          invState.confirmUndo = false;
+          renderInventory();
+        } else if (act === "undo-confirm") {
+          onUndoSale(id);
+        // ---- Delete bundle from a bundled item's detail (SPE-13) ----
+        } else if (act === "bundle-delete") {
+          invState.confirmBundleDelete = true;
+          renderInventory();
+        } else if (act === "bundle-delete-cancel") {
+          invState.confirmBundleDelete = false;
+          renderInventory();
+        } else if (act === "bundle-delete-confirm") {
+          const cur = AppStore.getItem(id);
+          invState.confirmBundleDelete = false;
+          if (cur && cur.sale && cur.sale.bundleId) deleteBundle(cur.sale.bundleId);
+          // deleteBundle un-sells items + commits; notify re-renders this detail
+          // (item is now unsold, so its actions flip back automatically).
+        } else if (act === "delete") {
+          invState.confirmDelete = true;
+          renderInventory();
+        } else if (act === "delete-cancel") {
+          invState.confirmDelete = false;
+          renderInventory();
+        } else if (act === "delete-confirm") {
+          invState.mode = "list";
+          invState.itemId = null;
+          invState.confirmDelete = false;
+          AppStore.removeItem(id); // notify() re-renders the list
+        }
+      });
+    });
+  }
+
+  /* ---------------------- SPE-12: single-sale confirm / undo ---------------------- */
+  function onConfirmSingleSale(id) {
+    const sf = invState.saleForm;
+    if (!sf) return;
+    const price = parseFloat(sf.price);
+    const fee = parseFloat(sf.fee);
+    const item = AppStore.getItem(id);
+    if (!item) return;
+    const sale = {
+      price: isNaN(price) ? 0 : price,
+      platform: sf.platform || "other",
+      fee: isNaN(fee) ? 0 : fee,
+      date: Date.now(),
+      bundleId: null
+    };
+    const profit = sale.price - (Number(item.costPaid) || 0) - sale.fee;
+    invState.saleForm = null;
+    invState.saleDone = { itemId: id, profit: profit };
+    AppStore.updateItem(id, { sale: sale, status: STATUS.SOLD }); // notify -> re-render shows success moment
+  }
+
+  function onUndoSale(id) {
+    const item = AppStore.getItem(id);
+    if (!item) return;
+    // Safety: bundled items must not be undone here (handled via delete-bundle).
+    if (item.sale && item.sale.bundleId) { invState.confirmUndo = false; renderInventory(); return; }
+    const back = item.listing ? STATUS.LISTED : STATUS.DRAFT;
+    invState.confirmUndo = false;
+    invState.saleDone = null;
+    AppStore.updateItem(id, { sale: null, status: back }); // notify -> re-render
+  }
+
+  /* ---------------------- SPE-13: delete a bundle (un-sell its items) ---------------------- */
+  // Clears sale on every item in the bundle, restores 'listed' (has listing) or
+  // 'draft', then removes the bundle. Used from bundled-item detail + dashboard.
+  function deleteBundle(bundleId) {
+    const bundle = AppStore.getBundle(bundleId);
+    if (!bundle) return;
+    (bundle.itemIds || []).forEach(function (iid) {
+      const it = AppStore.getItem(iid);
+      if (!it) return;
+      const back = it.listing ? STATUS.LISTED : STATUS.DRAFT;
+      AppStore.updateItem(iid, { sale: null, status: back });
+    });
+    AppStore.removeBundle(bundleId); // final mutation -> notify re-renders active view
+  }
+
+  // Guard mirroring suppressAddRerender: set true around store mutations inside
+  // inventory-detail edit handlers so a mutation's notify() doesn't re-render the
+  // detail view and blow away the caret / in-progress edit.
+  let suppressInvRerender = false;
+  function withoutInvRerender(fn) {
+    suppressInvRerender = true;
+    try { return fn(); } finally { suppressInvRerender = false; }
+  }
+
+  /* ===========================================================================
+     [DASHBOARD]  — SPE-14. Spend / revenue / fees / net profit + recent sales.
+     All figures come from Sales.summary() / Sales.recentSales() (invariants I1-I5).
+     dashState: { expanded: { bundleId: true } } — which bundle rows are open.
+     =========================================================================== */
+  const dashState = { expanded: {} };
+
+  function renderDashboard() {
+    const el = document.getElementById("dashboardBody");
+    if (!el) return;
+
+    const s = Sales.summary();
+    const feed = Sales.recentSales();
+    const netCls = s.netProfit >= 0 ? "pos" : "neg";
+
+    // ---- Headline stat cards ----
+    const statCards =
+      '<div class="stat-grid">' +
+        '<div class="stat hero">' +
+          '<div class="stat-lbl">Net Profit</div>' +
+          '<div class="stat-val ' + netCls + '">' + moneySigned(s.netProfit) + '</div>' +
+          '<div class="stat-note">Revenue &minus; fees &minus; cost of sold items</div>' +
+        '</div>' +
+        '<div class="stat"><div class="stat-lbl">Total Spent</div>' +
+          '<div class="stat-val">' + money(s.totalSpent) + '</div>' +
+          '<div class="stat-note">All items, incl. unsold</div></div>' +
+        '<div class="stat"><div class="stat-lbl">Total Revenue</div>' +
+          '<div class="stat-val">' + money(s.revenue) + '</div>' +
+          '<div class="stat-note">Sales + bundle totals</div></div>' +
+        '<div class="stat"><div class="stat-lbl">Total Fees</div>' +
+          '<div class="stat-val">' + money(s.fees) + '</div></div>' +
+        '<div class="stat"><div class="stat-lbl">Unsold Inventory</div>' +
+          '<div class="stat-val">' + money(s.unsoldCost) + '</div>' +
+          '<div class="stat-note">Cost still on the shelf</div></div>' +
+      '</div>';
+
+    // ---- Counts strip ----
+    const c = s.counts;
+    const countsCard =
+      '<div class="card">' +
+        '<div class="section-label">Inventory status</div>' +
+        '<div class="count-strip">' +
+          '<span class="count-pill"><b>' + c.listed + '</b> Listed</span>' +
+          '<span class="count-pill"><b>' + c.sold + '</b> Sold</span>' +
+          '<span class="count-pill"><b>' + c.draft + '</b> Draft</span>' +
+          '<span class="count-pill"><b>' + c["not-listing"] + '</b> Not Listing</span>' +
+        '</div>' +
+      '</div>';
+
+    // ---- Recent sales ----
+    let salesCard;
+    if (feed.length === 0) {
+      salesCard =
+        '<div class="card"><div class="placeholder">' +
+          '<span class="emoji">&#128181;</span>' +
+          'No sales yet.' +
+          '<div class="muted" style="margin-top:8px;">Mark an item sold or record a bundle sale from the Inventory tab.</div>' +
+        '</div></div>';
+    } else {
+      salesCard =
+        '<div class="section-label" style="margin-top:4px;">Recent sales</div>' +
+        feed.map(saleRowHTML).join("");
+    }
+
+    el.innerHTML = statCards + countsCard + salesCard;
+    wireDashboard();
+  }
+
+  // One recent-sales row (single sale OR bundle). Bundles can expand inline.
+  function saleRowHTML(entry) {
+    if (entry.kind === "single") {
+      const i = entry.item;
+      const profit = Sales.singleProfit(i);
+      const sub = [
+        PLATFORM_LABELS[i.sale.platform] || i.sale.platform || "—",
+        formatSaleDate(i.sale.date)
+      ].filter(Boolean).join(" · ");
+      return '' +
+        '<button class="sale-row" data-kind="single" data-item="' + i.id + '">' +
+          '<div class="sale-thumb-wrap">' + thumbHTML(i, "inv-thumb") + '</div>' +
+          '<div class="sale-meta">' +
+            '<div class="sale-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
+            '<div class="sale-sub">' + escapeHtml(sub) + '</div>' +
+          '</div>' +
+          '<div class="sale-right">' +
+            '<div class="sale-amt">' + money(i.sale.price) + '</div>' +
+            '<div class="sale-profit ' + (profit >= 0 ? "pos" : "neg") + '">' + moneySigned(profit) + '</div>' +
+          '</div>' +
+        '</button>';
+    }
+
+    // Bundle row.
+    const b = entry.bundle;
+    const items = Sales.bundleItems(b);
+    const profit = Sales.bundleProfit(b);
+    const first = items[0];
+    const thumb = first
+      ? thumbHTML(first, "inv-thumb")
+      : '<div class="inv-thumb placeholder-thumb">&#128230;</div>';
+    const sub = [
+      PLATFORM_LABELS[b.platform] || b.platform || "—",
+      formatSaleDate(b.date)
+    ].filter(Boolean).join(" · ");
+    const expanded = !!dashState.expanded[b.id];
+
+    let children = "";
+    if (expanded) {
+      children = '<div class="bundle-children">' +
+        items.map(function (i) {
+          return '<button class="bundle-child" data-kind="child" data-item="' + i.id + '">' +
+            thumbHTML(i, "inv-thumb") +
+            '<div class="bc-meta"><div class="bc-title">' + escapeHtml(itemDisplayTitle(i)) + '</div>' +
+            '<div class="bc-sub">Cost ' + money(i.costPaid) + '</div></div>' +
+            '<span class="bc-chevron">&rsaquo;</span>' +
+          '</button>';
+        }).join("") +
+        '</div>';
+    }
+
+    return '' +
+      '<button class="sale-row" data-kind="bundle" data-bundle="' + b.id + '">' +
+        '<div class="sale-thumb-wrap">' + thumb +
+          '<span class="nbadge">&times;' + items.length + '</span>' +
+        '</div>' +
+        '<div class="sale-meta">' +
+          '<div class="sale-title">Bundle — ' + items.length + ' item' + (items.length === 1 ? "" : "s") + '</div>' +
+          '<div class="sale-sub">' + escapeHtml(sub) + (expanded ? " · tap to collapse" : " · tap to expand") + '</div>' +
+        '</div>' +
+        '<div class="sale-right">' +
+          '<div class="sale-amt">' + money(b.totalPrice) + '</div>' +
+          '<div class="sale-profit ' + (profit >= 0 ? "pos" : "neg") + '">' + moneySigned(profit) + '</div>' +
+        '</div>' +
+      '</button>' +
+      children;
+  }
+
+  function wireDashboard() {
+    const el = document.getElementById("dashboardBody");
+    if (!el) return;
+    el.querySelectorAll(".sale-row").forEach(function (row) {
+      row.addEventListener("click", function () {
+        const kind = row.getAttribute("data-kind");
+        if (kind === "bundle") {
+          const bid = row.getAttribute("data-bundle");
+          if (dashState.expanded[bid]) delete dashState.expanded[bid];
+          else dashState.expanded[bid] = true;
+          renderDashboard();
+        } else {
+          jumpToItemDetail(row.getAttribute("data-item"));
+        }
+      });
+    });
+    // Expanded bundle child rows jump to that item's detail.
+    el.querySelectorAll(".bundle-child").forEach(function (row) {
+      row.addEventListener("click", function () {
+        jumpToItemDetail(row.getAttribute("data-item"));
+      });
+    });
+  }
+
+  // Open an item's detail in the Inventory tab (from a dashboard sale row).
+  function jumpToItemDetail(itemId) {
+    if (!itemId || !AppStore.getItem(itemId)) return;
+    exitBundleFlow();
+    invState.mode = "detail";
+    invState.itemId = itemId;
+    resetDetailFlags();
+    Router.go("inventory"); // triggers renderInventory via renderActive
+  }
+
+  function statusLabel(s) {
+    switch (s) {
+      case STATUS.LISTED: return "Listed";
+      case STATUS.SOLD: return "Sold";
+      case STATUS.NOT_LISTING: return "Not Listing";
+      default: return "Draft";
+    }
+  }
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // Re-render whatever tab is active. Views are idempotent, so it's cheap to
+  // render all three; but we only touch the visible one to be tidy.
+  function renderActive() {
+    const tab = Router.current();
+    // The Add flow renders itself explicitly at each step transition and holds
+    // transient DOM state (focus, in-progress edits). Suppress store-driven
+    // re-renders of it while a flow handler is mid-transition, so an intake
+    // mutation's notify() doesn't clobber the form. Other tabs always re-render.
+    if (tab === "add") { if (!suppressAddRerender) renderAdd(); }
+    else if (tab === "inventory") { if (!suppressInvRerender) renderInventory(); }
+    else if (tab === "dashboard") renderDashboard();
+  }
+  // Set true around store mutations inside Add-flow handlers that will call
+  // renderAdd() themselves afterward.
+  let suppressAddRerender = false;
+  function withoutAddRerender(fn) {
+    suppressAddRerender = true;
+    try { return fn(); } finally { suppressAddRerender = false; }
+  }
+
+  /* ===========================================================================
+     [ROUTER]  — bottom-tab switching. No hash; single-page section toggle.
+     =========================================================================== */
+  const Router = (function () {
+    let current = "add";
+    const SUBTITLES = {
+      add: "New item → AI listing",
+      inventory: "Your active stock",
+      dashboard: "Spend, revenue &amp; profit"
+    };
+    function go(tab) {
+      current = tab;
+      document.querySelectorAll(".view").forEach(v => {
+        v.classList.toggle("active", v.dataset.tab === tab);
+      });
+      document.querySelectorAll("#tabBar button").forEach(b => {
+        b.classList.toggle("active", b.dataset.tab === tab);
+      });
+      const sub = document.getElementById("headerSub");
+      if (sub) sub.innerHTML = SUBTITLES[tab] || "";
+      // Scroll main to top on tab change.
+      const main = document.querySelector(".app-main");
+      if (main) main.scrollTop = 0;
+      renderActive();
+    }
+    return { go, current: () => current };
+  })();
+
+  /* ===========================================================================
+     [BOOT]  — load persisted data, wire events, first render.
+     =========================================================================== */
+  (function boot() {
+    // Tab bar clicks
+    document.getElementById("tabBar").addEventListener("click", function (e) {
+      const btn = e.target.closest("button[data-tab]");
+      if (btn) Router.go(btn.dataset.tab);
+    });
+
+    // Settings gear (SPE-19).
+    const gear = document.getElementById("settingsBtn");
+    if (gear) gear.addEventListener("click", function () { openSettings(); });
+    // Close the settings modal with Escape.
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && settingsState.open) closeSettings();
+    });
+
+    // Intake flow (SPE-6..9) is rendered by renderAdd() into #addFlow and wires
+    // its own events on each render (see [ADD FLOW]). No boot-time wiring needed.
+
+    // Surface storage problems (quota / corruption) as a small non-blocking banner
+    // instead of only console — Alissa's on a phone with no console open (SPE-15).
+    Storage.onWarn(showStorageWarning);
+
+    // Views re-render on any store change.
+    AppStore.subscribe(function () { renderActive(); });
+
+    // Flush pending writes when the app is backgrounded / closed. Cover every path
+    // that can precede a reload / tab close (SPE-15): 'pagehide' fires on both
+    // reload and navigation-away; 'visibilitychange' -> hidden fires when the tab
+    // is backgrounded (the reliable one on mobile Safari, where 'pagehide' can be
+    // skipped). Flushing on hidden — while the page is still alive — gives the
+    // async window.storage write a real chance to complete before teardown, which
+    // closes the "reload within the 300ms debounce" data-loss window.
+    window.addEventListener("pagehide", function () { AppStore.flush(); });
+    window.addEventListener("beforeunload", function () { AppStore.flush(); });
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "hidden") AppStore.flush();
+    });
+
+    // Load persisted data + the API key (SPE-19) in parallel, then paint. The key
+    // load determines the AI mode shown in the intake/loading copy and Settings.
+    Promise.all([AppStore.load(), ApiKey.load()]).then(function () {
+      Router.go("add");
+    }).catch(function (e) {
+      console.error("[boot] load failed:", e);
+      Router.go("add");
+    });
+  })();
+  </script>
+</body>
+</html>
